@@ -8,6 +8,7 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 
 def get_ai_api_key():
@@ -15,6 +16,8 @@ def get_ai_api_key():
         return GEMINI_API_KEY, "gemini"
     if GROQ_API_KEY:
         return GROQ_API_KEY, "groq"
+    if OPENROUTER_API_KEY:
+        return OPENROUTER_API_KEY, "openrouter"
     return None, "none"
 
 
