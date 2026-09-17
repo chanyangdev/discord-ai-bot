@@ -4,9 +4,11 @@ import logging
 import re
 import time
 import unicodedata
+from asyncio import Lock
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from storage import connect_sqlite
 
@@ -46,6 +48,12 @@ class CachedResponse:
     sources: list[Any]
     answer_type: str
     patch_version: str
+
+
+@dataclass
+class _KeyLockEntry:
+    lock: Lock
+    references: int = 0
 
 
 def decide_cache_policy(
@@ -120,6 +128,54 @@ def build_cache_key(
 class ResponseCache:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        # This registry coordinates requests within one bot process only.
+        self._key_locks: dict[str, _KeyLockEntry] = {}
+        self._key_locks_guard = Lock()
+
+    @asynccontextmanager
+    async def _lock_for_key(self, cache_key: str):
+        async with self._key_locks_guard:
+            entry = self._key_locks.get(cache_key)
+            if entry is None:
+                entry = _KeyLockEntry(lock=Lock())
+                self._key_locks[cache_key] = entry
+            entry.references += 1
+
+        acquired = False
+        try:
+            await entry.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                entry.lock.release()
+            async with self._key_locks_guard:
+                entry.references -= 1
+                if entry.references == 0:
+                    self._key_locks.pop(cache_key, None)
+
+    async def get_or_load(
+        self,
+        cache_key: str,
+        loader: Callable[[], Awaitable[CachedResponse | None]],
+        *,
+        cacheable: bool = True,
+    ) -> CachedResponse | None:
+        cached = await self.get(cache_key) if cacheable else None
+        if cached is not None or not cacheable:
+            return cached if cached is not None else await loader()
+
+        async with self._lock_for_key(cache_key):
+            cached = await self.get(cache_key)
+            if cached is not None:
+                return cached
+
+            loaded = await loader()
+            if loaded is None:
+                return None
+
+            cached = await self.get(cache_key)
+            return cached if cached is not None else loaded
 
     async def get(self, cache_key: str) -> CachedResponse | None:
         now = int(time.time())
