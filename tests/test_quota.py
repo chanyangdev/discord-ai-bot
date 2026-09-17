@@ -1,108 +1,154 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from storage import QuotaExceeded, TokenUsageStore
+from storage import DailyUsage, QuotaExceeded, TokenUsageStore
 
 
-def _utc_day(offset_days: int = 0) -> str:
-    return (datetime.now(timezone.utc) + timedelta(days=offset_days)).strftime(
-        "%Y-%m-%d"
-    )
-
-
-def test_persistence_after_reconnect(tmp_path):
+def test_persistence_and_independent_users(tmp_path):
     db_path = tmp_path / "quota.db"
 
     async def run() -> None:
         store = TokenUsageStore(str(db_path), daily_limit=1000)
         await store.initialize()
-        await store.reserve_tokens(101, 202, _utc_day(), 300)
-        await store.apply_usage(101, 202, _utc_day(), 300, 250, 50)
+        await store.reserve_tokens(1, 300, 1000)
+        await store.commit_tokens(1, 300, 250, 50)
+        await store.reserve_tokens(2, 1000, 1000)
+        assert (await store.get_daily_usage(2)).reserved_tokens == 1000
         await store.close()
 
         reopened = TokenUsageStore(str(db_path), daily_limit=1000)
         await reopened.initialize()
-        try:
-            assert await reopened.usage_for_day(101, 202, _utc_day()) == 300
-            with pytest.raises(QuotaExceeded):
-                await reopened.reserve_tokens(101, 202, _utc_day(), 801)
-        finally:
-            await reopened.close()
+        user_one = await reopened.get_daily_usage(1)
+        assert user_one.prompt_tokens == 250
+        assert user_one.completion_tokens == 50
+        assert user_one.successful_requests == 1
+        assert (await reopened.get_daily_usage(2)).reserved_tokens == 0
+        await reopened.close()
 
     asyncio.run(run())
 
 
-def test_concurrent_near_limit_reservations(tmp_path):
+def test_startup_recovers_crashed_reservations(tmp_path):
+    db_path = tmp_path / "quota.db"
+
+    async def run() -> None:
+        store = TokenUsageStore(str(db_path), daily_limit=1000)
+        await store.initialize()
+        await store.reserve_tokens(3, 400, 1000)
+        await store.close()
+
+        recovered = TokenUsageStore(str(db_path), daily_limit=1000)
+        await recovered.initialize()
+        assert (await recovered.get_daily_usage(3)).reserved_tokens == 0
+        await recovered.close()
+
+    asyncio.run(run())
+
+
+def test_repeated_initialization_preserves_live_reservations(tmp_path):
+    db_path = tmp_path / "quota.db"
+
+    async def run() -> None:
+        store = TokenUsageStore(str(db_path), daily_limit=1000)
+        await store.initialize()
+        await store.reserve_tokens(4, 400, 1000)
+        await store.initialize()
+        assert (await store.get_daily_usage(4)).reserved_tokens == 400
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_cross_guild_aggregation_is_user_global(tmp_path):
+    db_path = tmp_path / "quota.db"
+
+    async def run() -> None:
+        store = TokenUsageStore(str(db_path), daily_limit=1000)
+        await store.initialize()
+        await store.reserve_tokens(5, 600, 1000)
+        with pytest.raises(QuotaExceeded):
+            await store.reserve_tokens(5, 500, 1000)
+        assert (await store.get_daily_usage(5)).reserved_tokens == 600
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_atomic_concurrent_reservations(tmp_path):
     db_path = tmp_path / "quota.db"
 
     async def run() -> None:
         store = TokenUsageStore(str(db_path), daily_limit=1000)
         await store.initialize()
 
-        async def reserve(value: int) -> bool:
+        async def reserve() -> bool:
             try:
-                await store.reserve_tokens(5, 6, _utc_day(), value)
+                await store.reserve_tokens(7, 600, 1000)
                 return True
             except QuotaExceeded:
                 return False
 
-        results = await asyncio.gather(
-            reserve(600),
-            reserve(600),
-        )
-
+        results = await asyncio.gather(reserve(), reserve())
         assert results.count(True) == 1
-        assert await store.usage_for_day(5, 6, _utc_day()) == 600
+        assert (await store.get_daily_usage(7)).reserved_tokens == 600
         await store.close()
 
     asyncio.run(run())
 
 
-def test_failed_call_releases_reservation(tmp_path):
+def test_success_reconciliation_and_failure_release(tmp_path):
     db_path = tmp_path / "quota.db"
 
     async def run() -> None:
         store = TokenUsageStore(str(db_path), daily_limit=1000)
         await store.initialize()
-        today = _utc_day()
-        await store.reserve_tokens(7, 8, today, 400)
-        await store.release_tokens(7, 8, today, 400)
-        assert await store.usage_for_day(7, 8, today) == 0
+        await store.reserve_tokens(8, 400, 1000)
+        assert await store.commit_tokens(8, 400, 250, 50) == 300
+        usage = await store.get_daily_usage(8)
+        assert usage.reserved_tokens == 0
+        assert usage.prompt_tokens == 250
+        assert usage.completion_tokens == 50
+        await store.reserve_tokens(9, 400, 1000)
+        await store.release_tokens(9, 400)
+        assert (await store.get_daily_usage(9)).reserved_tokens == 0
+        with pytest.raises(LookupError):
+            await store.release_tokens(9, 400)
         await store.close()
 
     asyncio.run(run())
 
 
-def test_dm_guild_id_handling(tmp_path):
+def test_cancellation_is_safe(tmp_path):
     db_path = tmp_path / "quota.db"
 
     async def run() -> None:
         store = TokenUsageStore(str(db_path), daily_limit=1000)
         await store.initialize()
-        today = _utc_day()
-        await store.reserve_tokens(9, 0, today, 120)
-        assert await store.usage_for_day(9, 0, today) == 120
+        await store.reserve_tokens(10, 400, 1000)
+        task = asyncio.create_task(store.commit_tokens(10, 400, 1, 1))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await store.release_tokens(10, 400)
+        assert (await store.get_daily_usage(10)).reserved_tokens == 0
         await store.close()
 
     asyncio.run(run())
 
 
-def test_utc_day_isolation(tmp_path):
+def test_utc_day_isolation_and_empty_usage(tmp_path):
     db_path = tmp_path / "quota.db"
 
     async def run() -> None:
         store = TokenUsageStore(str(db_path), daily_limit=1000)
         await store.initialize()
-        today = _utc_day()
-        yesterday = _utc_day(-1)
-
-        await store.reserve_tokens(11, 12, today, 300)
-        await store.reserve_tokens(11, 12, yesterday, 250)
-
-        assert await store.usage_for_day(11, 12, today) == 300
-        assert await store.usage_for_day(11, 12, yesterday) == 250
+        usage = await store.get_daily_usage(11)
+        assert isinstance(usage, DailyUsage)
+        assert usage.prompt_tokens == 0
+        assert usage.completion_tokens == 0
+        assert usage.reserved_tokens == 0
+        assert usage.usage_date
         await store.close()
 
     asyncio.run(run())

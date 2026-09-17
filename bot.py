@@ -13,8 +13,15 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from prompt_estimation import estimate_reservation_tokens
+from provider_usage import (
+    ProviderUsage,
+    aggregate_provider_usage,
+    usage_for_commit,
+)
+from quota_service import QuotaService
 from response_cache import ResponseCache, parse_canonical_patch_version
-from storage import QuotaExceeded, TokenUsageStore
+from storage import DailyUsage, QuotaExceeded, TokenUsageStore
 
 load_dotenv()
 
@@ -59,7 +66,19 @@ GEMINI_FALLBACK_MODEL = os.getenv(
 )
 TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
 SQLITE_PATH = os.getenv("SQLITE_PATH", str(Path("data") / "jarvis.db"))
-FREE_DAILY_TOKEN_LIMIT = int(os.getenv("FREE_DAILY_TOKEN_LIMIT", "200000"))
+FREE_DAILY_TOKEN_LIMIT: int = _get_positive_int_env(
+    "FREE_DAILY_TOKEN_LIMIT",
+    200000,
+)
+PREMIUM_DAILY_TOKEN_LIMIT: int = _get_positive_int_env(
+    "PREMIUM_DAILY_TOKEN_LIMIT",
+    1000000,
+)
+TOKEN_QUOTA_RESET_TIMEZONE: str = "UTC"
+TOKEN_RESERVATION_TTL_SECONDS: int = _get_positive_int_env(
+    "TOKEN_RESERVATION_TTL_SECONDS",
+    900,
+)
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
 RESPONSE_CACHE_ENABLED = _get_bool_env("RESPONSE_CACHE_ENABLED", True)
 RESPONSE_CACHE_STATIC_TTL_SECONDS = _get_positive_int_env(
@@ -96,6 +115,7 @@ class Bot(discord.Client):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.token_usage_store: TokenUsageStore | None = None
+        self.quota_service: QuotaService | None = None
         self.response_cache: ResponseCache | None = None
         self.response_cache_cleanup_task: asyncio.Task[None] | None = None
 
@@ -113,6 +133,12 @@ class Bot(discord.Client):
                 FREE_DAILY_TOKEN_LIMIT,
             )
             await self.token_usage_store.initialize()
+            self.quota_service = QuotaService(
+                self.token_usage_store,
+                free_daily_limit=FREE_DAILY_TOKEN_LIMIT,
+                premium_daily_limit=PREMIUM_DAILY_TOKEN_LIMIT,
+                paid_entitlement_lookup=_no_verified_paid_entitlement,
+            )
 
         if self.response_cache is None:
             self.response_cache = ResponseCache(SQLITE_PATH)
@@ -192,12 +218,6 @@ def utc_date_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def estimate_prompt_tokens(prompt: str) -> int:
-    if not prompt:
-        return 0
-    return max(1, len(prompt.encode("utf-8")) // 4)
-
-
 def build_generation_config() -> types.GenerateContentConfig:
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
@@ -205,11 +225,35 @@ def build_generation_config() -> types.GenerateContentConfig:
     )
 
 
-async def reserve_user_tokens(user_id: int, guild_id: int, prompt: str) -> int:
+async def _no_verified_paid_entitlement(user_id: int) -> bool:
+    return False
+
+
+def format_usage_response(usage: DailyUsage, daily_limit: int) -> str:
+    committed_tokens = usage.prompt_tokens + usage.completion_tokens
+    remaining_tokens = max(0, daily_limit - committed_tokens)
+    return (
+        "**Daily quota**\n"
+        f"Committed tokens: `{committed_tokens:,}`\n"
+        f"Daily limit: `{daily_limit:,}`\n"
+        f"Remaining tokens: `{remaining_tokens:,}`\n"
+        "Resets: `00:00 UTC`"
+    )
+
+
+async def reserve_user_tokens(
+    user_id: int,
+    guild_id: int,
+    contents: list[dict],
+) -> int:
     if discord_client.token_usage_store is None:
         await discord_client.setup_hook()
 
-    reserved_amount = estimate_prompt_tokens(prompt) + GEMINI_MAX_OUTPUT_TOKENS
+    reserved_amount = estimate_reservation_tokens(
+        system_text=SYSTEM_PROMPT,
+        contents=contents,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+    )
     await discord_client.token_usage_store.reserve_tokens(
         user_id,
         guild_id,
@@ -235,31 +279,18 @@ async def update_usage_after_response(
     user_id: int,
     guild_id: int,
     reserved_amount: int,
-    response: object,
+    provider_usage: ProviderUsage,
 ) -> None:
     if discord_client.token_usage_store is None:
         return
-
-    usage = getattr(response, "usage_metadata", None)
-    prompt_tokens = 0
-    completion_tokens = 0
-
-    if usage is not None:
-        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
-        completion_tokens = (
-            getattr(usage, "candidates_token_count", 0)
-            or getattr(usage, "response_token_count", 0)
-            or getattr(usage, "completion_token_count", 0)
-            or 0
-        )
 
     await discord_client.token_usage_store.apply_usage(
         user_id,
         guild_id,
         utc_date_now(),
         reserved_amount,
-        prompt_tokens,
-        completion_tokens,
+        provider_usage.prompt_tokens,
+        provider_usage.completion_tokens,
     )
 
 
@@ -317,13 +348,17 @@ async def stream_gemini_reply(
 
     reserved_amount = 0
     try:
-        reserved_amount = await reserve_user_tokens(user_id, guild_id, prompt)
+        reserved_amount = await reserve_user_tokens(user_id, guild_id, contents)
     except QuotaExceeded:
         await status_message.edit(
-            content="You’ve reached your daily token limit. Please try again tomorrow."
+            content=(
+                "You’ve reached your daily token limit. "
+                "Cached answers still work; please try again after the 00:00 UTC reset."
+            )
         )
         raise
 
+    round_usages: list[ProviderUsage] = []
     for model_index, model_name in enumerate(models_to_try):
         full_answer = ""
         last_edit_time = 0.0
@@ -366,11 +401,24 @@ async def stream_gemini_reply(
                     full_answer[DISCORD_MESSAGE_LIMIT:],
                 )
 
+            round_usages.append(
+                usage_for_commit(
+                    type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
+                    fallback_prompt_tokens=max(
+                        0,
+                        reserved_amount - GEMINI_MAX_OUTPUT_TOKENS,
+                    ),
+                    fallback_completion_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                )
+            )
+            final_usage = aggregate_provider_usage(round_usages)
+            if final_usage is None:
+                raise RuntimeError("Provider usage reconciliation had no rounds")
             await update_usage_after_response(
                 user_id,
                 guild_id,
                 reserved_amount,
-                type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
+                final_usage,
             )
             return full_answer
 
@@ -390,6 +438,21 @@ async def stream_gemini_reply(
             )
 
             if can_try_fallback:
+                if usage_metadata is not None:
+                    round_usages.append(
+                        usage_for_commit(
+                            type(
+                                "UsageHolder",
+                                (),
+                                {"usage_metadata": usage_metadata},
+                            )(),
+                            fallback_prompt_tokens=max(
+                                0,
+                                reserved_amount - GEMINI_MAX_OUTPUT_TOKENS,
+                            ),
+                            fallback_completion_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                        )
+                    )
                 logger.info(
                     "Primary model %s reached quota; trying fallback %s",
                     model_name,
@@ -588,6 +651,26 @@ async def ask_command(
     question: str,
 ) -> None:
     await handle_slash_ai_request(interaction, question.strip())
+
+
+@tree.command(
+    name="usage",
+    description="Show your daily AI token usage",
+)
+async def usage_command(interaction: discord.Interaction) -> None:
+    if discord_client.token_usage_store is None or discord_client.quota_service is None:
+        await discord_client.setup_hook()
+
+    usage = await discord_client.token_usage_store.get_daily_usage(
+        interaction.user.id
+    )
+    daily_limit = await discord_client.quota_service.resolve_daily_limit(
+        interaction.user.id
+    )
+    await interaction.response.send_message(
+        format_usage_response(usage, daily_limit),
+        ephemeral=True,
+    )
 
 
 @tree.command(
