@@ -5,6 +5,13 @@ from typing import Any
 import aiosqlite
 
 
+SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
+
+
+def connect_sqlite(db_path: str | os.PathLike[str]) -> aiosqlite.Connection:
+    return aiosqlite.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+
+
 class QuotaExceeded(RuntimeError):
     """Raised when a user exceeds the per-day quota."""
 
@@ -19,7 +26,7 @@ class TokenUsageStore:
         if directory:
             os.makedirs(directory, exist_ok=True)
 
-        async with aiosqlite.connect(self.db_path) as connection:
+        async with connect_sqlite(self.db_path) as connection:
             await connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS token_usage (
@@ -71,7 +78,7 @@ class TokenUsageStore:
         if amount <= 0:
             return 0
 
-        async with aiosqlite.connect(self.db_path) as connection:
+        async with connect_sqlite(self.db_path) as connection:
             await connection.execute("BEGIN IMMEDIATE")
             await connection.execute(
                 """
@@ -111,7 +118,7 @@ class TokenUsageStore:
         if amount <= 0:
             return 0
 
-        async with aiosqlite.connect(self.db_path) as connection:
+        async with connect_sqlite(self.db_path) as connection:
             await connection.execute("BEGIN IMMEDIATE")
             await connection.execute(
                 """
@@ -141,7 +148,7 @@ class TokenUsageStore:
     ) -> int:
         actual_total = max(0, int(prompt_tokens) + int(completion_tokens))
 
-        async with aiosqlite.connect(self.db_path) as connection:
+        async with connect_sqlite(self.db_path) as connection:
             await connection.execute("BEGIN IMMEDIATE")
             cursor = await connection.execute(
                 """
@@ -186,7 +193,7 @@ class TokenUsageStore:
         guild_id: int,
         utc_date: str,
     ) -> int:
-        async with aiosqlite.connect(self.db_path) as connection:
+        async with connect_sqlite(self.db_path) as connection:
             cursor = await connection.execute(
                 """
                 SELECT COALESCE(used_tokens, 0)
