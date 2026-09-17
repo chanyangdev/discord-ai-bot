@@ -35,6 +35,27 @@ class TokenUsageStore:
                 "CREATE INDEX IF NOT EXISTS idx_token_usage_lookup "
                 "ON token_usage (user_id, guild_id, utc_date)"
             )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS response_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    patch_version TEXT NOT NULL,
+                    question_hash TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    sources_json TEXT NOT NULL DEFAULT '[]',
+                    answer_type TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    last_accessed_at INTEGER NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (hit_count >= 0)
+                )
+                """
+            )
+            await connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_response_cache_expires_at "
+                "ON response_cache (expires_at)"
+            )
             await connection.commit()
 
     async def close(self) -> None:
