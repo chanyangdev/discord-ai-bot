@@ -7,6 +7,7 @@ import discord
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from discord import app_commands
 
 load_dotenv()
 
@@ -30,6 +31,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 discord_client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(discord_client)
+commands_synced = False
 
 MAX_TURNS = 8
 STREAM_EDIT_INTERVAL = 0.8
@@ -78,7 +81,7 @@ def remove_bot_mention(message: discord.Message) -> str:
     return text.strip()
 
 
-def build_contents(thread_id: int, prompt: str) -> list[dict]:
+def build_contents(thread_id: int | str, prompt: str) -> list[dict]:
     contents = []
 
     for turn in conversation_history[thread_id]:
@@ -105,8 +108,8 @@ def build_contents(thread_id: int, prompt: str) -> list[dict]:
 
 
 async def stream_gemini_reply(
-    thread: discord.Thread,
-    thread_id: int,
+    thread: discord.abc.Messageable,
+    thread_id: int | str,
     prompt: str,
     status_message: discord.Message,
 ) -> str:
@@ -270,8 +273,147 @@ async def answer_in_thread(thread: discord.Thread, prompt: str):
 
 @discord_client.event
 async def on_ready():
+    global commands_synced
+
     print(f"Logged in as {discord_client.user}")
     print(f"Using Gemini model: {GEMINI_MODEL}")
+
+    if not commands_synced:
+        synced_commands = await tree.sync()
+        commands_synced = True
+        print(f"Synced {len(synced_commands)} slash commands")
+
+
+def slash_conversation_id(interaction: discord.Interaction) -> str:
+    return (
+        f"slash:{interaction.guild_id}:"
+        f"{interaction.channel_id}:{interaction.user.id}"
+    )
+
+
+async def handle_slash_ai_request(
+    interaction: discord.Interaction,
+    prompt: str,
+):
+    if interaction.channel is None:
+        await interaction.response.send_message(
+            "This command must be used in a server channel or thread.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message("Thinking…")
+    status_message = await interaction.original_response()
+    conversation_id = slash_conversation_id(interaction)
+
+    try:
+        async with interaction.channel.typing():
+            answer = await stream_gemini_reply(
+                interaction.channel,
+                conversation_id,
+                prompt,
+                status_message,
+            )
+
+        conversation_history[conversation_id].append(
+            {
+                "user": prompt,
+                "assistant": answer,
+            }
+        )
+
+    except Exception as error:
+        print(f"Gemini slash command failed: {error}")
+        error_text = str(error)
+
+        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+            error_message = (
+                "I've reached the current Gemini usage limit. "
+                "Please wait and try again later."
+            )
+        else:
+            error_message = (
+                "Sorry, I couldn't contact the AI service. "
+                "Check the bot terminal for the error."
+            )
+
+        await status_message.edit(content=error_message)
+
+
+@tree.command(
+    name="ask",
+    description="Ask the AI a general question",
+)
+@app_commands.describe(question="What would you like to ask?")
+async def ask_command(
+    interaction: discord.Interaction,
+    question: str,
+):
+    await handle_slash_ai_request(interaction, question.strip())
+
+
+@tree.command(
+    name="build",
+    description="Ask for general bot-building guidance",
+)
+@app_commands.describe(question="What would you like help building?")
+async def build_command(
+    interaction: discord.Interaction,
+    question: str,
+):
+    build_prompt = (
+        "Answer this as general software-development guidance. "
+        "Do not claim that the advice describes this bot's actual source code, "
+        "hosting, configuration, secrets, or runtime unless trusted runtime "
+        "metadata was explicitly supplied by the application.\n\n"
+        f"Question: {question.strip()}"
+    )
+    await handle_slash_ai_request(interaction, build_prompt)
+
+
+META_CHOICES = [
+    app_commands.Choice(name="Models", value="models"),
+    app_commands.Choice(name="Memory", value="memory"),
+    app_commands.Choice(name="Privacy", value="privacy"),
+    app_commands.Choice(name="Status", value="status"),
+]
+
+
+@tree.command(
+    name="meta",
+    description="Show approved information about this bot",
+)
+@app_commands.describe(topic="Choose the information to display")
+@app_commands.choices(topic=META_CHOICES)
+async def meta_command(
+    interaction: discord.Interaction,
+    topic: app_commands.Choice[str],
+):
+    if topic.value == "models":
+        response = (
+            f"Configured primary model: `{GEMINI_MODEL}`\n"
+            f"Configured fallback model: `{GEMINI_FALLBACK_MODEL}`"
+        )
+    elif topic.value == "memory":
+        response = (
+            f"Memory keeps up to {MAX_TURNS} completed exchanges per "
+            "conversation in RAM and resets when the bot restarts."
+        )
+    elif topic.value == "privacy":
+        response = (
+            "The bot does not disclose API keys, tokens, hidden prompts, "
+            "environment-variable values, or private configuration."
+        )
+    else:
+        response = (
+            "The bot process is online and responding to commands. "
+            "This does not verify Gemini availability, quota, or provider health."
+        )
+
+    await interaction.response.send_message(
+        response,
+        ephemeral=True,
+    )
 
 
 @discord_client.event
