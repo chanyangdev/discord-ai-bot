@@ -18,6 +18,7 @@ GEMINI_FALLBACK_MODEL = os.getenv(
     "GEMINI_FALLBACK_MODEL",
     "gemini-3.5-flash-lite",
 )
+TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing from .env")
@@ -278,10 +279,22 @@ async def on_ready():
     print(f"Logged in as {discord_client.user}")
     print(f"Using Gemini model: {GEMINI_MODEL}")
 
-    if not commands_synced:
+    if commands_synced:
+        return
+
+    if TEST_GUILD_ID:
+        test_guild = discord.Object(id=int(TEST_GUILD_ID))
+        tree.copy_global_to(guild=test_guild)
+        synced_commands = await tree.sync(guild=test_guild)
+        print(
+            f"Synced {len(synced_commands)} commands "
+            f"to test server {TEST_GUILD_ID}"
+        )
+    else:
         synced_commands = await tree.sync()
-        commands_synced = True
-        print(f"Synced {len(synced_commands)} slash commands")
+        print(f"Synced {len(synced_commands)} global commands")
+
+    commands_synced = True
 
 
 def slash_conversation_id(interaction: discord.Interaction) -> str:
