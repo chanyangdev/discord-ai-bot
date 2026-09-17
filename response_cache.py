@@ -292,13 +292,24 @@ class ResponseCache:
         *,
         cacheable: bool = True,
     ) -> CachedResponse | None:
-        cached = await self.get(cache_key) if cacheable else None
+        if not cacheable:
+            return await loader()
+
+        try:
+            cached = await self.get(cache_key)
+        except Exception:
+            logger.warning("response cache read failed; continuing uncached")
+            cached = None
         if cached is not None or not cacheable:
-            return cached if cached is not None else await loader()
+            return cached
 
         async with self._lock_for_key(cache_key):
             # The initial lookup owns hit/miss accounting; this recheck is silent.
-            cached = await self.get(cache_key, observe=False)
+            try:
+                cached = await self.get(cache_key, observe=False)
+            except Exception:
+                logger.warning("response cache read failed; continuing uncached")
+                cached = None
             if cached is not None:
                 return cached
 
@@ -306,8 +317,39 @@ class ResponseCache:
             if loaded is None:
                 return None
 
-            cached = await self.get(cache_key, observe=False)
+            try:
+                cached = await self.get(cache_key, observe=False)
+            except Exception:
+                logger.warning("response cache read failed; returning uncached")
+                cached = None
             return cached if cached is not None else loaded
+
+    async def load_and_cache(
+        self,
+        cache_key: str,
+        loader: Callable[[], Awaitable[CachedResponse]],
+        *,
+        question_hash: str,
+        ttl_seconds: int,
+        cacheable: bool = True,
+    ) -> CachedResponse:
+        async def load() -> CachedResponse:
+            response = await loader()
+            try:
+                await self.put(
+                    cache_key,
+                    response.patch_version,
+                    question_hash,
+                    response.answer,
+                    response.sources,
+                    response.answer_type,
+                    ttl_seconds,
+                )
+            except Exception:
+                logger.warning("response cache write failed; continuing uncached")
+            return response
+
+        return await self.get_or_load(cache_key, load, cacheable=cacheable)
 
     async def get(
         self,

@@ -116,7 +116,10 @@ class Bot(discord.Client):
 
         if self.response_cache is None:
             self.response_cache = ResponseCache(SQLITE_PATH)
-            await self.response_cache.delete_expired()
+            try:
+                await self.response_cache.delete_expired()
+            except Exception:
+                logger.warning("Response cache startup cleanup failed; continuing")
 
         if self.response_cache_cleanup_task is None:
             self.response_cache_cleanup_task = asyncio.create_task(
