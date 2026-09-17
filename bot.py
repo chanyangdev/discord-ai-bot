@@ -16,6 +16,34 @@ from storage import QuotaExceeded, TokenUsageStore
 
 load_dotenv()
 
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean value like true/false or 1/0.")
+
+
+def _get_positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a positive integer.") from exc
+
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be a positive integer.")
+    return parsed
+
 logger = logging.getLogger("jarvis")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
@@ -31,6 +59,24 @@ TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
 SQLITE_PATH = os.getenv("SQLITE_PATH", str(Path("data") / "jarvis.db"))
 FREE_DAILY_TOKEN_LIMIT = int(os.getenv("FREE_DAILY_TOKEN_LIMIT", "200000"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+RESPONSE_CACHE_ENABLED = _get_bool_env("RESPONSE_CACHE_ENABLED", True)
+RESPONSE_CACHE_STATIC_TTL_SECONDS = _get_positive_int_env(
+    "RESPONSE_CACHE_STATIC_TTL_SECONDS",
+    604800,
+)
+RESPONSE_CACHE_META_TTL_SECONDS = _get_positive_int_env(
+    "RESPONSE_CACHE_META_TTL_SECONDS",
+    21600,
+)
+RESPONSE_CACHE_PATCH_NOTES_TTL_SECONDS = _get_positive_int_env(
+    "RESPONSE_CACHE_PATCH_NOTES_TTL_SECONDS",
+    86400,
+)
+RESPONSE_CACHE_CLEANUP_INTERVAL_SECONDS = _get_positive_int_env(
+    "RESPONSE_CACHE_CLEANUP_INTERVAL_SECONDS",
+    21600,
+)
+RESPONSE_CACHE_KEY_VERSION = os.getenv("RESPONSE_CACHE_KEY_VERSION", "v1")
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing from .env")
