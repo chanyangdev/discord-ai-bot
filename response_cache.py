@@ -6,6 +6,7 @@ import time
 import unicodedata
 from asyncio import Lock
 from contextlib import asynccontextmanager
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable
@@ -35,6 +36,29 @@ class AnswerType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class CacheEvent(str, Enum):
+    HIT = "response_cache_hit"
+    MISS = "response_cache_miss"
+    WRITE = "response_cache_write"
+    SKIP = "response_cache_skip"
+    ERROR = "response_cache_error"
+
+
+class CacheSkipReason(str, Enum):
+    UNSUCCESSFUL = "unsuccessful"
+    CONVERSATION_HISTORY = "conversation_history"
+    PLAYER_SPECIFIC = "player_specific"
+    UNSAFE_TO_SHARE = "unsafe_to_share"
+    NOT_CACHEABLE = "not_cacheable"
+
+
+class CacheErrorOperation(str, Enum):
+    GET = "get"
+    PUT = "put"
+    DELETE_EXPIRED = "delete_expired"
+    INVALIDATE_PATCH = "invalidate_patch"
+
+
 @dataclass(frozen=True)
 class CachePolicyDecision:
     cacheable: bool
@@ -49,6 +73,86 @@ class CachedResponse:
     sources: list[Any]
     answer_type: str
     patch_version: str
+
+
+class CacheTelemetry:
+    def __init__(self) -> None:
+        self._counts: Counter[str] = Counter()
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return dict(self._counts)
+
+    def hit_rate(self) -> float:
+        hits = self._counts[CacheEvent.HIT.value]
+        misses = self._counts[CacheEvent.MISS.value]
+        total = hits + misses
+        return hits / total if total else 0.0
+
+    def record_hit(self, answer_type: str | None, patch_version: str | None) -> None:
+        self._record(CacheEvent.HIT, answer_type, patch_version)
+
+    def record_miss(self) -> None:
+        self._record(CacheEvent.MISS)
+
+    def record_write(self, answer_type: str | None, patch_version: str | None) -> None:
+        self._record(CacheEvent.WRITE, answer_type, patch_version)
+
+    def record_skip(self, reason: str, answer_type: str | None = None) -> None:
+        safe_reason = CacheSkipReason(reason).value
+        self._record(CacheEvent.SKIP, answer_type=answer_type, reason=safe_reason)
+
+    def record_error(self, operation: str) -> None:
+        safe_operation = CacheErrorOperation(operation).value
+        self._record(CacheEvent.ERROR, reason=safe_operation)
+
+    def _record(
+        self,
+        event: CacheEvent,
+        answer_type: str | None = None,
+        patch_version: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self._counts[event.value] += 1
+        fields = [f"event={event.value}"]
+        if reason is not None:
+            self._counts[f"{event.value}:{reason}"] += 1
+            fields.append(f"reason={reason}")
+
+        safe_answer_type = _safe_answer_type(answer_type)
+        if safe_answer_type is not None:
+            self._counts[f"{event.value}:answer_type:{safe_answer_type}"] += 1
+            fields.append(f"answer_type={safe_answer_type}")
+
+        safe_patch_version = _safe_patch_version(patch_version)
+        if safe_patch_version is not None:
+            self._counts[f"{event.value}:patch_version:{safe_patch_version}"] += 1
+            fields.append(f"patch_version={safe_patch_version}")
+
+        logger.info("response cache telemetry %s", " ".join(fields))
+
+
+def _safe_answer_type(answer_type: str | None) -> str | None:
+    try:
+        classification = AnswerType(answer_type)
+    except (TypeError, ValueError):
+        return None
+    if classification in {
+        AnswerType.STATIC_FACT,
+        AnswerType.BUILD_META,
+        AnswerType.PATCH_SUMMARY,
+    }:
+        return classification.value
+    return None
+
+
+def _safe_patch_version(patch_version: str | None) -> str | None:
+    if patch_version is None:
+        return None
+    try:
+        return parse_canonical_patch_version(patch_version)
+    except ValueError:
+        return None
 
 
 def parse_canonical_patch_version(patch_version: str) -> str:
@@ -74,6 +178,7 @@ def decide_cache_policy(
     static_ttl_seconds: int = RESPONSE_CACHE_STATIC_TTL_SECONDS,
     meta_ttl_seconds: int = RESPONSE_CACHE_META_TTL_SECONDS,
     patch_notes_ttl_seconds: int = RESPONSE_CACHE_PATCH_NOTES_TTL_SECONDS,
+    telemetry: CacheTelemetry | None = None,
 ) -> CachePolicyDecision:
     try:
         classification = AnswerType(answer_type)
@@ -81,15 +186,25 @@ def decide_cache_policy(
         classification = AnswerType.UNKNOWN
 
     if not successful:
-        return CachePolicyDecision(False, classification.value, None, "unsuccessful")
+        reason = CacheSkipReason.UNSUCCESSFUL.value
+        if telemetry is not None:
+            telemetry.record_skip(reason, classification.value)
+        return CachePolicyDecision(False, classification.value, None, reason)
     if depends_on_conversation_history:
-        return CachePolicyDecision(
-            False, classification.value, None, "conversation_history"
-        )
+        reason = CacheSkipReason.CONVERSATION_HISTORY.value
+        if telemetry is not None:
+            telemetry.record_skip(reason, classification.value)
+        return CachePolicyDecision(False, classification.value, None, reason)
     if player_specific or classification is AnswerType.PLAYER_SPECIFIC:
-        return CachePolicyDecision(False, classification.value, None, "player_specific")
+        reason = CacheSkipReason.PLAYER_SPECIFIC.value
+        if telemetry is not None:
+            telemetry.record_skip(reason, classification.value)
+        return CachePolicyDecision(False, classification.value, None, reason)
     if not safe_to_share:
-        return CachePolicyDecision(False, classification.value, None, "unsafe_to_share")
+        reason = CacheSkipReason.UNSAFE_TO_SHARE.value
+        if telemetry is not None:
+            telemetry.record_skip(reason, classification.value)
+        return CachePolicyDecision(False, classification.value, None, reason)
 
     ttl_by_type = {
         AnswerType.STATIC_FACT: static_ttl_seconds,
@@ -98,7 +213,10 @@ def decide_cache_policy(
     }
     ttl_seconds = ttl_by_type.get(classification)
     if ttl_seconds is None:
-        return CachePolicyDecision(False, classification.value, None, "not_cacheable")
+        reason = CacheSkipReason.NOT_CACHEABLE.value
+        if telemetry is not None:
+            telemetry.record_skip(reason, classification.value)
+        return CachePolicyDecision(False, classification.value, None, reason)
     return CachePolicyDecision(True, classification.value, ttl_seconds, None)
 
 
@@ -134,8 +252,13 @@ def build_cache_key(
 
 
 class ResponseCache:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        telemetry: CacheTelemetry | None = None,
+    ) -> None:
         self.db_path = db_path
+        self.telemetry = telemetry or CacheTelemetry()
         # This registry coordinates requests within one bot process only.
         self._key_locks: dict[str, _KeyLockEntry] = {}
         self._key_locks_guard = Lock()
@@ -174,7 +297,8 @@ class ResponseCache:
             return cached if cached is not None else await loader()
 
         async with self._lock_for_key(cache_key):
-            cached = await self.get(cache_key)
+            # The initial lookup owns hit/miss accounting; this recheck is silent.
+            cached = await self.get(cache_key, observe=False)
             if cached is not None:
                 return cached
 
@@ -182,48 +306,68 @@ class ResponseCache:
             if loaded is None:
                 return None
 
-            cached = await self.get(cache_key)
+            cached = await self.get(cache_key, observe=False)
             return cached if cached is not None else loaded
 
-    async def get(self, cache_key: str) -> CachedResponse | None:
+    async def get(
+        self,
+        cache_key: str,
+        *,
+        observe: bool = True,
+    ) -> CachedResponse | None:
         now = int(time.time())
 
-        async with connect_sqlite(self.db_path) as connection:
-            await connection.execute("BEGIN IMMEDIATE")
-            cursor = await connection.execute(
-                """
-                SELECT answer, sources_json, answer_type, patch_version
-                FROM response_cache
-                WHERE cache_key = ? AND expires_at > ?
-                """,
-                (cache_key, now),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                await connection.rollback()
-                return None
+        try:
+            async with connect_sqlite(self.db_path) as connection:
+                await connection.execute("BEGIN IMMEDIATE")
+                cursor = await connection.execute(
+                    """
+                    SELECT answer, sources_json, answer_type, patch_version
+                    FROM response_cache
+                    WHERE cache_key = ? AND expires_at > ?
+                    """,
+                    (cache_key, now),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await connection.rollback()
+                    if observe:
+                        self.telemetry.record_miss()
+                    return None
 
-            try:
-                sources = json.loads(row[1])
-            except (TypeError, json.JSONDecodeError):
-                logger.warning("response cache malformed row: invalid sources JSON")
-                await connection.rollback()
-                return None
+                try:
+                    sources = json.loads(row[1])
+                except (TypeError, json.JSONDecodeError):
+                    logger.warning("response cache malformed row: invalid sources JSON")
+                    await connection.rollback()
+                    self.telemetry.record_error(CacheErrorOperation.GET.value)
+                    if observe:
+                        self.telemetry.record_miss()
+                    return None
 
-            if not isinstance(sources, list):
-                logger.warning("response cache malformed row: sources is not a list")
-                await connection.rollback()
-                return None
+                if not isinstance(sources, list):
+                    logger.warning("response cache malformed row: sources is not a list")
+                    await connection.rollback()
+                    self.telemetry.record_error(CacheErrorOperation.GET.value)
+                    if observe:
+                        self.telemetry.record_miss()
+                    return None
 
-            await connection.execute(
-                """
-                UPDATE response_cache
-                SET hit_count = hit_count + 1, last_accessed_at = ?
-                WHERE cache_key = ? AND expires_at > ?
-                """,
-                (now, cache_key, now),
-            )
-            await connection.commit()
+                await connection.execute(
+                    """
+                    UPDATE response_cache
+                    SET hit_count = hit_count + 1, last_accessed_at = ?
+                    WHERE cache_key = ? AND expires_at > ?
+                    """,
+                    (now, cache_key, now),
+                )
+                await connection.commit()
+        except Exception:
+            self.telemetry.record_error(CacheErrorOperation.GET.value)
+            raise
+
+        if observe:
+            self.telemetry.record_hit(row[2], row[3])
 
         return CachedResponse(
             answer=row[0],
@@ -251,54 +395,67 @@ class ResponseCache:
         expires_at = created_at + ttl_seconds
         sources_json = json.dumps(sources, ensure_ascii=False)
 
-        async with connect_sqlite(self.db_path) as connection:
-            await connection.execute(
-                """
-                INSERT INTO response_cache (
-                    cache_key, patch_version, question_hash, answer,
-                    sources_json, answer_type, created_at, expires_at,
-                    last_accessed_at, hit_count
+        try:
+            async with connect_sqlite(self.db_path) as connection:
+                await connection.execute(
+                    """
+                    INSERT INTO response_cache (
+                        cache_key, patch_version, question_hash, answer,
+                        sources_json, answer_type, created_at, expires_at,
+                        last_accessed_at, hit_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        patch_version = excluded.patch_version,
+                        question_hash = excluded.question_hash,
+                        answer = excluded.answer,
+                        sources_json = excluded.sources_json,
+                        answer_type = excluded.answer_type,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at,
+                        last_accessed_at = excluded.last_accessed_at,
+                        hit_count = 0
+                    """,
+                    (
+                        cache_key,
+                        patch_version,
+                        question_hash,
+                        answer,
+                        sources_json,
+                        answer_type,
+                        created_at,
+                        expires_at,
+                        created_at,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    patch_version = excluded.patch_version,
-                    question_hash = excluded.question_hash,
-                    answer = excluded.answer,
-                    sources_json = excluded.sources_json,
-                    answer_type = excluded.answer_type,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at,
-                    last_accessed_at = excluded.last_accessed_at,
-                    hit_count = 0
-                """,
-                (
-                    cache_key,
-                    patch_version,
-                    question_hash,
-                    answer,
-                    sources_json,
-                    answer_type,
-                    created_at,
-                    expires_at,
-                    created_at,
-                ),
-            )
-            await connection.commit()
+                await connection.commit()
+        except Exception:
+            self.telemetry.record_error(CacheErrorOperation.PUT.value)
+            raise
+        self.telemetry.record_write(answer_type, patch_version)
 
     async def delete_expired(self) -> int:
-        async with connect_sqlite(self.db_path) as connection:
-            cursor = await connection.execute(
-                "DELETE FROM response_cache WHERE expires_at <= ?",
-                (int(time.time()),),
-            )
-            await connection.commit()
-            return cursor.rowcount
+        try:
+            async with connect_sqlite(self.db_path) as connection:
+                cursor = await connection.execute(
+                    "DELETE FROM response_cache WHERE expires_at <= ?",
+                    (int(time.time()),),
+                )
+                await connection.commit()
+                return cursor.rowcount
+        except Exception:
+            self.telemetry.record_error(CacheErrorOperation.DELETE_EXPIRED.value)
+            raise
 
     async def invalidate_patch(self, patch_version: str) -> int:
-        async with connect_sqlite(self.db_path) as connection:
-            cursor = await connection.execute(
-                "DELETE FROM response_cache WHERE patch_version = ?",
-                (patch_version,),
-            )
-            await connection.commit()
-            return cursor.rowcount
+        try:
+            async with connect_sqlite(self.db_path) as connection:
+                cursor = await connection.execute(
+                    "DELETE FROM response_cache WHERE patch_version = ?",
+                    (patch_version,),
+                )
+                await connection.commit()
+                return cursor.rowcount
+        except Exception:
+            self.telemetry.record_error(CacheErrorOperation.INVALIDATE_PATCH.value)
+            raise
