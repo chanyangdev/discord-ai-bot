@@ -12,6 +12,10 @@ load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODEL = os.getenv(
+    "GEMINI_FALLBACK_MODEL",
+    "gemini-2.5-flash-lite",
+)
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing from .env")
@@ -98,13 +102,34 @@ def build_contents(thread_id: int, prompt: str) -> list[dict]:
 
 
 def ask_gemini(thread_id: int, prompt: str) -> str:
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=build_contents(thread_id, prompt),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-        ),
+    contents = build_contents(thread_id, prompt)
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
     )
+
+    try:
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=config,
+        )
+    except Exception as error:
+        error_text = str(error)
+
+        if "429" not in error_text and "RESOURCE_EXHAUSTED" not in error_text:
+            raise
+
+        print(
+            f"Primary model {GEMINI_MODEL} reached its quota. "
+            f"Trying fallback model {GEMINI_FALLBACK_MODEL}."
+        )
+
+        response = gemini.models.generate_content(
+            model=GEMINI_FALLBACK_MODEL,
+            contents=contents,
+            config=config,
+        )
+
     return response.text or "I couldn't generate a response."
 
 
@@ -134,6 +159,13 @@ async def answer_in_thread(thread: discord.Thread, prompt: str):
 
     except Exception as error:
         print(f"Gemini request failed: {error}")
+        error_text = str(error)
+        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+            await thread.send(
+                "I've reached the current Gemini usage limit. Please wait and try again later."
+            )
+            return
+
         await thread.send(
             "Sorry, I couldn't contact the AI service. Check the bot terminal for the error."
         )
