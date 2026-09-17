@@ -5,13 +5,39 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from storage import connect_sqlite
 
 
 RESPONSE_CACHE_KEY_VERSION = "v1"
+RESPONSE_CACHE_STATIC_TTL_SECONDS = 604800
+RESPONSE_CACHE_META_TTL_SECONDS = 21600
+RESPONSE_CACHE_PATCH_NOTES_TTL_SECONDS = 86400
 logger = logging.getLogger(__name__)
+
+
+class AnswerType(str, Enum):
+    STATIC_FACT = "static_fact"
+    BUILD_META = "build_meta"
+    PATCH_SUMMARY = "patch_summary"
+    PLAYER_SPECIFIC = "player_specific"
+    ACCOUNT_DATA = "account_data"
+    PRIVATE_CONTENT = "private_content"
+    ADMIN_COMMAND = "admin_command"
+    MODERATION_OUTCOME = "moderation_outcome"
+    ERROR = "error"
+    REFUSAL = "refusal"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CachePolicyDecision:
+    cacheable: bool
+    answer_type: str
+    ttl_seconds: int | None
+    skip_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -20,6 +46,44 @@ class CachedResponse:
     sources: list[Any]
     answer_type: str
     patch_version: str
+
+
+def decide_cache_policy(
+    answer_type: AnswerType | str,
+    *,
+    successful: bool = True,
+    depends_on_conversation_history: bool = False,
+    player_specific: bool = False,
+    safe_to_share: bool = True,
+    static_ttl_seconds: int = RESPONSE_CACHE_STATIC_TTL_SECONDS,
+    meta_ttl_seconds: int = RESPONSE_CACHE_META_TTL_SECONDS,
+    patch_notes_ttl_seconds: int = RESPONSE_CACHE_PATCH_NOTES_TTL_SECONDS,
+) -> CachePolicyDecision:
+    try:
+        classification = AnswerType(answer_type)
+    except ValueError:
+        classification = AnswerType.UNKNOWN
+
+    if not successful:
+        return CachePolicyDecision(False, classification.value, None, "unsuccessful")
+    if depends_on_conversation_history:
+        return CachePolicyDecision(
+            False, classification.value, None, "conversation_history"
+        )
+    if player_specific or classification is AnswerType.PLAYER_SPECIFIC:
+        return CachePolicyDecision(False, classification.value, None, "player_specific")
+    if not safe_to_share:
+        return CachePolicyDecision(False, classification.value, None, "unsafe_to_share")
+
+    ttl_by_type = {
+        AnswerType.STATIC_FACT: static_ttl_seconds,
+        AnswerType.BUILD_META: meta_ttl_seconds,
+        AnswerType.PATCH_SUMMARY: patch_notes_ttl_seconds,
+    }
+    ttl_seconds = ttl_by_type.get(classification)
+    if ttl_seconds is None:
+        return CachePolicyDecision(False, classification.value, None, "not_cacheable")
+    return CachePolicyDecision(True, classification.value, ttl_seconds, None)
 
 
 def normalize_question(question: str) -> str:
