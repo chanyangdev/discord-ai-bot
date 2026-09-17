@@ -1,6 +1,7 @@
 import asyncio
 import os
 from collections import defaultdict, deque
+import time
 
 import discord
 from dotenv import load_dotenv
@@ -31,6 +32,8 @@ intents.message_content = True
 discord_client = discord.Client(intents=intents)
 
 MAX_TURNS = 8
+STREAM_EDIT_INTERVAL = 0.8
+DISCORD_MESSAGE_LIMIT = 1900
 SYSTEM_PROMPT = """
 You are a friendly, practical AI assistant in a Discord server.
 
@@ -101,6 +104,90 @@ def build_contents(thread_id: int, prompt: str) -> list[dict]:
     return contents
 
 
+async def stream_gemini_reply(
+    thread: discord.Thread,
+    thread_id: int,
+    prompt: str,
+    status_message: discord.Message,
+) -> str:
+    contents = build_contents(thread_id, prompt)
+
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models_to_try.append(GEMINI_FALLBACK_MODEL)
+
+    for model_index, model_name in enumerate(models_to_try):
+        full_answer = ""
+        last_edit_time = 0.0
+
+        try:
+            stream = await gemini.aio.models.generate_content_stream(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                ),
+            )
+
+            async for chunk in stream:
+                chunk_text = chunk.text or ""
+                if not chunk_text:
+                    continue
+
+                full_answer += chunk_text
+                now = time.monotonic()
+
+                if now - last_edit_time >= STREAM_EDIT_INTERVAL:
+                    preview = full_answer[:DISCORD_MESSAGE_LIMIT]
+                    if len(full_answer) > DISCORD_MESSAGE_LIMIT:
+                        preview = preview[:-3] + "..."
+
+                    await status_message.edit(content=preview)
+                    last_edit_time = now
+
+            if not full_answer:
+                full_answer = "I couldn't generate a response."
+
+            await status_message.edit(
+                content=full_answer[:DISCORD_MESSAGE_LIMIT]
+            )
+
+            if len(full_answer) > DISCORD_MESSAGE_LIMIT:
+                await send_long_message(
+                    thread,
+                    full_answer[DISCORD_MESSAGE_LIMIT:],
+                )
+
+            return full_answer
+
+        except Exception as error:
+            error_text = str(error)
+            is_quota_error = (
+                "429" in error_text
+                or "RESOURCE_EXHAUSTED" in error_text
+            )
+            can_try_fallback = (
+                model_index == 0
+                and len(models_to_try) > 1
+                and not full_answer
+                and is_quota_error
+            )
+
+            if can_try_fallback:
+                print(
+                    f"Primary model {model_name} reached its quota. "
+                    f"Trying fallback model {models_to_try[1]}."
+                )
+                await status_message.edit(
+                    content="Primary model is busy — trying the fallback…"
+                )
+                continue
+
+            raise
+
+    raise RuntimeError("No Gemini model was available.")
+
+
 def ask_gemini(thread_id: int, prompt: str) -> str:
     contents = build_contents(thread_id, prompt)
     config = types.GenerateContentConfig(
@@ -140,14 +227,19 @@ async def send_long_message(channel, text: str):
 
 
 async def answer_in_thread(thread: discord.Thread, prompt: str):
+    status_message = None
+
     try:
         async with thread.typing():
-            answer = await asyncio.to_thread(
-                ask_gemini,
+            status_message = await thread.send("Thinking…")
+            answer = await stream_gemini_reply(
+                thread,
                 thread.id,
                 prompt,
+                status_message,
             )
 
+        # Save the exchange only after the complete response succeeds.
         conversation_history[thread.id].append(
             {
                 "user": prompt,
@@ -155,20 +247,25 @@ async def answer_in_thread(thread: discord.Thread, prompt: str):
             }
         )
 
-        await send_long_message(thread, answer)
-
     except Exception as error:
         print(f"Gemini request failed: {error}")
         error_text = str(error)
-        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
-            await thread.send(
-                "I've reached the current Gemini usage limit. Please wait and try again later."
-            )
-            return
 
-        await thread.send(
-            "Sorry, I couldn't contact the AI service. Check the bot terminal for the error."
-        )
+        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+            error_message = (
+                "I've reached the current Gemini usage limit. "
+                "Please wait and try again later."
+            )
+        else:
+            error_message = (
+                "Sorry, I couldn't contact the AI service. "
+                "Check the bot terminal for the error."
+            )
+
+        if status_message is not None:
+            await status_message.edit(content=error_message)
+        else:
+            await thread.send(error_message)
 
 
 @discord_client.event
