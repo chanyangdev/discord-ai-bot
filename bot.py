@@ -1,15 +1,24 @@
 import asyncio
+import logging
 import os
-from collections import defaultdict, deque
 import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
+from discord import app_commands
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from discord import app_commands
+
+from storage import QuotaExceeded, TokenUsageStore
 
 load_dotenv()
+
+logger = logging.getLogger("jarvis")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -19,6 +28,9 @@ GEMINI_FALLBACK_MODEL = os.getenv(
     "gemini-3.5-flash-lite",
 )
 TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
+SQLITE_PATH = os.getenv("SQLITE_PATH", str(Path("data") / "jarvis.db"))
+FREE_DAILY_TOKEN_LIMIT = int(os.getenv("FREE_DAILY_TOKEN_LIMIT", "200000"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing from .env")
@@ -31,7 +43,30 @@ gemini = genai.Client(api_key=GEMINI_API_KEY)
 intents = discord.Intents.default()
 intents.message_content = True
 
-discord_client = discord.Client(intents=intents)
+
+class Bot(discord.Client):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.token_usage_store: TokenUsageStore | None = None
+
+    async def setup_hook(self) -> None:
+        if self.token_usage_store is not None:
+            return
+
+        self.token_usage_store = TokenUsageStore(
+            SQLITE_PATH,
+            FREE_DAILY_TOKEN_LIMIT,
+        )
+        await self.token_usage_store.initialize()
+        logger.info("Initialized SQLite quota store at %s", SQLITE_PATH)
+
+    async def close(self) -> None:
+        if self.token_usage_store is not None:
+            await self.token_usage_store.close()
+        await super().close()
+
+
+discord_client = Bot(intents=intents)
 tree = app_commands.CommandTree(discord_client)
 commands_synced = False
 
@@ -70,6 +105,81 @@ BOUNDARIES
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_TURNS))
 
 
+def utc_date_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def estimate_prompt_tokens(prompt: str) -> int:
+    if not prompt:
+        return 0
+    return max(1, len(prompt.encode("utf-8")) // 4)
+
+
+def build_generation_config() -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+    )
+
+
+async def reserve_user_tokens(user_id: int, guild_id: int, prompt: str) -> int:
+    if discord_client.token_usage_store is None:
+        await discord_client.setup_hook()
+
+    reserved_amount = estimate_prompt_tokens(prompt) + GEMINI_MAX_OUTPUT_TOKENS
+    await discord_client.token_usage_store.reserve_tokens(
+        user_id,
+        guild_id,
+        utc_date_now(),
+        reserved_amount,
+    )
+    return reserved_amount
+
+
+async def release_user_tokens(user_id: int, guild_id: int, reserved_amount: int) -> None:
+    if discord_client.token_usage_store is None:
+        return
+
+    await discord_client.token_usage_store.release_tokens(
+        user_id,
+        guild_id,
+        utc_date_now(),
+        reserved_amount,
+    )
+
+
+async def update_usage_after_response(
+    user_id: int,
+    guild_id: int,
+    reserved_amount: int,
+    response: object,
+) -> None:
+    if discord_client.token_usage_store is None:
+        return
+
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    if usage is not None:
+        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        completion_tokens = (
+            getattr(usage, "candidates_token_count", 0)
+            or getattr(usage, "response_token_count", 0)
+            or getattr(usage, "completion_token_count", 0)
+            or 0
+        )
+
+    await discord_client.token_usage_store.apply_usage(
+        user_id,
+        guild_id,
+        utc_date_now(),
+        reserved_amount,
+        prompt_tokens,
+        completion_tokens,
+    )
+
+
 def remove_bot_mention(message: discord.Message) -> str:
     text = message.content
 
@@ -83,7 +193,7 @@ def remove_bot_mention(message: discord.Message) -> str:
 
 
 def build_contents(thread_id: int | str, prompt: str) -> list[dict]:
-    contents = []
+    contents: list[dict] = []
 
     for turn in conversation_history[thread_id]:
         contents.append(
@@ -113,27 +223,40 @@ async def stream_gemini_reply(
     thread_id: int | str,
     prompt: str,
     status_message: discord.Message,
+    *,
+    user_id: int,
+    guild_id: int,
 ) -> str:
     contents = build_contents(thread_id, prompt)
-
     models_to_try = [GEMINI_MODEL]
     if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
         models_to_try.append(GEMINI_FALLBACK_MODEL)
 
+    reserved_amount = 0
+    try:
+        reserved_amount = await reserve_user_tokens(user_id, guild_id, prompt)
+    except QuotaExceeded:
+        await status_message.edit(
+            content="You’ve reached your daily token limit. Please try again tomorrow."
+        )
+        raise
+
     for model_index, model_name in enumerate(models_to_try):
         full_answer = ""
         last_edit_time = 0.0
+        usage_metadata = None
 
         try:
             stream = await gemini.aio.models.generate_content_stream(
                 model=model_name,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                ),
+                config=build_generation_config(),
             )
 
             async for chunk in stream:
+                if getattr(chunk, "usage_metadata", None) is not None:
+                    usage_metadata = chunk.usage_metadata
+
                 chunk_text = chunk.text or ""
                 if not chunk_text:
                     continue
@@ -152,9 +275,7 @@ async def stream_gemini_reply(
             if not full_answer:
                 full_answer = "I couldn't generate a response."
 
-            await status_message.edit(
-                content=full_answer[:DISCORD_MESSAGE_LIMIT]
-            )
+            await status_message.edit(content=full_answer[:DISCORD_MESSAGE_LIMIT])
 
             if len(full_answer) > DISCORD_MESSAGE_LIMIT:
                 await send_long_message(
@@ -162,13 +283,21 @@ async def stream_gemini_reply(
                     full_answer[DISCORD_MESSAGE_LIMIT:],
                 )
 
+            await update_usage_after_response(
+                user_id,
+                guild_id,
+                reserved_amount,
+                type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
+            )
             return full_answer
 
+        except asyncio.CancelledError:
+            await release_user_tokens(user_id, guild_id, reserved_amount)
+            raise
         except Exception as error:
             error_text = str(error)
             is_quota_error = (
-                "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text
+                "429" in error_text or "RESOURCE_EXHAUSTED" in error_text
             )
             can_try_fallback = (
                 model_index == 0
@@ -178,15 +307,17 @@ async def stream_gemini_reply(
             )
 
             if can_try_fallback:
-                print(
-                    f"Primary model {model_name} reached its quota. "
-                    f"Trying fallback model {models_to_try[1]}."
+                logger.info(
+                    "Primary model %s reached quota; trying fallback %s",
+                    model_name,
+                    models_to_try[1],
                 )
                 await status_message.edit(
                     content="Primary model is busy — trying the fallback…"
                 )
                 continue
 
+            await release_user_tokens(user_id, guild_id, reserved_amount)
             raise
 
     raise RuntimeError("No Gemini model was available.")
@@ -194,9 +325,7 @@ async def stream_gemini_reply(
 
 def ask_gemini(thread_id: int, prompt: str) -> str:
     contents = build_contents(thread_id, prompt)
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-    )
+    config = build_generation_config()
 
     try:
         response = gemini.models.generate_content(
@@ -210,9 +339,10 @@ def ask_gemini(thread_id: int, prompt: str) -> str:
         if "429" not in error_text and "RESOURCE_EXHAUSTED" not in error_text:
             raise
 
-        print(
-            f"Primary model {GEMINI_MODEL} reached its quota. "
-            f"Trying fallback model {GEMINI_FALLBACK_MODEL}."
+        logger.info(
+            "Primary model %s reached quota; trying fallback %s",
+            GEMINI_MODEL,
+            GEMINI_FALLBACK_MODEL,
         )
 
         response = gemini.models.generate_content(
@@ -224,13 +354,18 @@ def ask_gemini(thread_id: int, prompt: str) -> str:
     return response.text or "I couldn't generate a response."
 
 
-async def send_long_message(channel, text: str):
-    # Discord messages have a 2,000-character limit.
+async def send_long_message(channel: discord.abc.Messageable, text: str) -> None:
     for start in range(0, len(text), 1900):
         await channel.send(text[start : start + 1900])
 
 
-async def answer_in_thread(thread: discord.Thread, prompt: str):
+async def answer_in_thread(
+    thread: discord.Thread,
+    prompt: str,
+    *,
+    user_id: int,
+    guild_id: int,
+) -> None:
     status_message = None
 
     try:
@@ -241,18 +376,20 @@ async def answer_in_thread(thread: discord.Thread, prompt: str):
                 thread.id,
                 prompt,
                 status_message,
+                user_id=user_id,
+                guild_id=guild_id,
             )
 
-        # Save the exchange only after the complete response succeeds.
         conversation_history[thread.id].append(
             {
                 "user": prompt,
                 "assistant": answer,
             }
         )
-
+    except QuotaExceeded:
+        return
     except Exception as error:
-        print(f"Gemini request failed: {error}")
+        logger.warning("Gemini request failed: %s", type(error).__name__)
         error_text = str(error)
 
         if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
@@ -273,11 +410,11 @@ async def answer_in_thread(thread: discord.Thread, prompt: str):
 
 
 @discord_client.event
-async def on_ready():
+async def on_ready() -> None:
     global commands_synced
 
-    print(f"Logged in as {discord_client.user}")
-    print(f"Using Gemini model: {GEMINI_MODEL}")
+    logger.info("Logged in as %s", discord_client.user)
+    logger.info("Using Gemini model: %s", GEMINI_MODEL)
 
     if commands_synced:
         return
@@ -286,13 +423,14 @@ async def on_ready():
         test_guild = discord.Object(id=int(TEST_GUILD_ID))
         tree.copy_global_to(guild=test_guild)
         synced_commands = await tree.sync(guild=test_guild)
-        print(
-            f"Synced {len(synced_commands)} commands "
-            f"to test server {TEST_GUILD_ID}"
+        logger.info(
+            "Synced %s commands to test server %s",
+            len(synced_commands),
+            TEST_GUILD_ID,
         )
     else:
         synced_commands = await tree.sync()
-        print(f"Synced {len(synced_commands)} global commands")
+        logger.info("Synced %s global commands", len(synced_commands))
 
     commands_synced = True
 
@@ -307,7 +445,7 @@ def slash_conversation_id(interaction: discord.Interaction) -> str:
 async def handle_slash_ai_request(
     interaction: discord.Interaction,
     prompt: str,
-):
+) -> None:
     if interaction.channel is None:
         await interaction.response.send_message(
             "This command must be used in a server channel or thread.",
@@ -318,6 +456,7 @@ async def handle_slash_ai_request(
     await interaction.response.send_message("Thinking…")
     status_message = await interaction.original_response()
     conversation_id = slash_conversation_id(interaction)
+    guild_id = interaction.guild_id or 0
 
     try:
         async with interaction.channel.typing():
@@ -326,6 +465,8 @@ async def handle_slash_ai_request(
                 conversation_id,
                 prompt,
                 status_message,
+                user_id=interaction.user.id,
+                guild_id=guild_id,
             )
 
         conversation_history[conversation_id].append(
@@ -334,9 +475,10 @@ async def handle_slash_ai_request(
                 "assistant": answer,
             }
         )
-
+    except QuotaExceeded:
+        return
     except Exception as error:
-        print(f"Gemini slash command failed: {error}")
+        logger.warning("Gemini slash command failed: %s", type(error).__name__)
         error_text = str(error)
 
         if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
@@ -361,7 +503,7 @@ async def handle_slash_ai_request(
 async def ask_command(
     interaction: discord.Interaction,
     question: str,
-):
+) -> None:
     await handle_slash_ai_request(interaction, question.strip())
 
 
@@ -373,7 +515,7 @@ async def ask_command(
 async def build_command(
     interaction: discord.Interaction,
     question: str,
-):
+) -> None:
     build_prompt = (
         "Answer this as general software-development guidance. "
         "Do not claim that the advice describes this bot's actual source code, "
@@ -401,7 +543,7 @@ META_CHOICES = [
 async def meta_command(
     interaction: discord.Interaction,
     topic: app_commands.Choice[str],
-):
+) -> None:
     if topic.value == "models":
         response = (
             f"Configured primary model: `{GEMINI_MODEL}`\n"
@@ -430,8 +572,7 @@ async def meta_command(
 
 
 @discord_client.event
-async def on_message(message: discord.Message):
-    # Never respond to bots, including itself.
+async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
@@ -443,7 +584,12 @@ async def on_message(message: discord.Message):
         if not prompt:
             return
 
-        await answer_in_thread(message.channel, prompt)
+        await answer_in_thread(
+            message.channel,
+            prompt,
+            user_id=message.author.id,
+            guild_id=message.guild.id if message.guild else 0,
+        )
         return
 
     if discord_client.user not in message.mentions:
@@ -464,7 +610,12 @@ async def on_message(message: discord.Message):
             name=thread_name,
             auto_archive_duration=60,
         )
-        await answer_in_thread(thread, prompt)
+        await answer_in_thread(
+            thread,
+            prompt,
+            user_id=message.author.id,
+            guild_id=message.guild.id if message.guild else 0,
+        )
 
     except discord.Forbidden:
         await message.reply(
@@ -472,7 +623,7 @@ async def on_message(message: discord.Message):
             mention_author=False,
         )
     except Exception as error:
-        print(f"Thread creation failed: {error}")
+        logger.warning("Thread creation failed: %s", type(error).__name__)
         await message.reply(
             "Sorry, I couldn't create a thread. Check the bot terminal for the error.",
             mention_author=False,
