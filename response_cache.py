@@ -17,6 +17,7 @@ RESPONSE_CACHE_KEY_VERSION = "v1"
 RESPONSE_CACHE_STATIC_TTL_SECONDS = 604800
 RESPONSE_CACHE_META_TTL_SECONDS = 21600
 RESPONSE_CACHE_PATCH_NOTES_TTL_SECONDS = 86400
+PATCH_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +49,13 @@ class CachedResponse:
     sources: list[Any]
     answer_type: str
     patch_version: str
+
+
+def parse_canonical_patch_version(patch_version: str) -> str:
+    canonical = patch_version.strip()
+    if not PATCH_VERSION_PATTERN.fullmatch(canonical):
+        raise ValueError("patch version must use the exact major.minor format")
+    return canonical
 
 
 @dataclass

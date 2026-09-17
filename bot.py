@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import logging
 import os
 import time
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from response_cache import ResponseCache, parse_canonical_patch_version
 from storage import QuotaExceeded, TokenUsageStore
 
 load_dotenv()
@@ -94,19 +96,51 @@ class Bot(discord.Client):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.token_usage_store: TokenUsageStore | None = None
+        self.response_cache: ResponseCache | None = None
+        self.response_cache_cleanup_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
-        if self.token_usage_store is not None:
+        if (
+            self.token_usage_store is not None
+            and self.response_cache is not None
+            and self.response_cache_cleanup_task is not None
+        ):
             return
 
-        self.token_usage_store = TokenUsageStore(
-            SQLITE_PATH,
-            FREE_DAILY_TOKEN_LIMIT,
-        )
-        await self.token_usage_store.initialize()
+        if self.token_usage_store is None:
+            self.token_usage_store = TokenUsageStore(
+                SQLITE_PATH,
+                FREE_DAILY_TOKEN_LIMIT,
+            )
+            await self.token_usage_store.initialize()
+
+        if self.response_cache is None:
+            self.response_cache = ResponseCache(SQLITE_PATH)
+            await self.response_cache.delete_expired()
+
+        if self.response_cache_cleanup_task is None:
+            self.response_cache_cleanup_task = asyncio.create_task(
+                self._response_cache_cleanup_loop()
+            )
         logger.info("Initialized SQLite quota store at %s", SQLITE_PATH)
 
+    async def _response_cache_cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(RESPONSE_CACHE_CLEANUP_INTERVAL_SECONDS)
+            try:
+                if self.response_cache is not None:
+                    await self.response_cache.delete_expired()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Response cache cleanup failed; will retry")
+
     async def close(self) -> None:
+        if self.response_cache_cleanup_task is not None:
+            self.response_cache_cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.response_cache_cleanup_task
+            self.response_cache_cleanup_task = None
         if self.token_usage_store is not None:
             await self.token_usage_store.close()
         await super().close()
@@ -580,6 +614,11 @@ META_CHOICES = [
 ]
 
 
+async def owner_only(interaction: discord.Interaction) -> bool:
+    application = await discord_client.application_info()
+    return interaction.user.id == application.owner.id
+
+
 @tree.command(
     name="meta",
     description="Show approved information about this bot",
@@ -613,6 +652,37 @@ async def meta_command(
 
     await interaction.response.send_message(
         response,
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="invalidate-cache",
+    description="Invalidate cached answers for an exact patch version",
+)
+@app_commands.describe(patch_version="Exact patch version, for example 14.1")
+@app_commands.check(owner_only)
+async def invalidate_cache_command(
+    interaction: discord.Interaction,
+    patch_version: str,
+) -> None:
+    try:
+        canonical_patch_version = parse_canonical_patch_version(patch_version)
+    except ValueError:
+        await interaction.response.send_message(
+            "Invalid patch version.",
+            ephemeral=True,
+        )
+        return
+
+    if discord_client.response_cache is None:
+        await discord_client.setup_hook()
+
+    deleted_count = await discord_client.response_cache.invalidate_patch(
+        canonical_patch_version
+    )
+    await interaction.response.send_message(
+        f"Invalidated {deleted_count} cached entr{'y' if deleted_count == 1 else 'ies'}.",
         ephemeral=True,
     )
 
