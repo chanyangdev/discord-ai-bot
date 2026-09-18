@@ -880,7 +880,11 @@ async def answer_in_thread(
     except (AdmissionError, AdmissionShutdown, BudgetUnavailable):
         return
     except Exception as error:
-        logger.warning("OpenRouter request failed: %s", type(error).__name__)
+        logger.warning(
+            "OpenRouter request failed: %s: %s",
+            type(error).__name__,
+            str(error)[:300],
+        )
         if status_message is not None:
             await status_message.edit(content=PROVIDER_ERROR_MESSAGE)
         else:
@@ -963,7 +967,11 @@ async def handle_slash_ai_request(
     except (AdmissionError, AdmissionShutdown, BudgetUnavailable):
         return
     except Exception as error:
-        logger.warning("OpenRouter slash command failed: %s", type(error).__name__)
+        logger.warning(
+            "OpenRouter slash command failed: %s: %s",
+            type(error).__name__,
+            str(error)[:300],
+        )
         await status_message.edit(content=PROVIDER_ERROR_MESSAGE)
 
 
