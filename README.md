@@ -1,5 +1,27 @@
 # Discord bot for personal server
 
+## J.A.R.V.I.S. persona configuration
+
+The system prompt is built at startup by [persona.py](persona.py) from
+environment variables instead of being hardcoded, so it stays testable and
+adjustable without editing code:
+
+| Variable | Effect |
+|---|---|
+| `BOT_PERSONA` (`jarvis` default, or `plain`) | Selects the J.A.R.V.I.S. system prompt or a neutral generic-assistant fallback. |
+| `JARVIS_OWNER_HONORIFIC` | If set, the prompt instructs the bot to address the server owner with this honorific; if unset, no honorific is used. |
+| `JARVIS_FORMALITY` (`casual`/`balanced`/`formal`) | Adjusts the tone guidance in the prompt. |
+| `JARVIS_HUMOR_LEVEL` (`none`/`low`/`medium`) | Adjusts how much dry wit the prompt permits. |
+| `JARVIS_DEFAULT_VERBOSITY` (`concise`/`detailed`) | Adjusts the default reply-length guidance. |
+| `JARVIS_USE_MARVEL_REFERENCES` (bool) | Permits occasional light Stark-adjacent references when `true`; otherwise the prompt forbids them. |
+| `JARVIS_REQUIRE_PATCH_FOR_META` (bool) | When `true`, live-meta answers must cite patch-grounded sources, never model memory alone. |
+
+These only change wording in the system prompt; they never remove the
+non-negotiable safety sections (never-guess-meta rule, boundaries, and the
+"not the literal copyrighted character" disclaimer), which are identical for
+every persona. See [tests/test_persona.py](tests/test_persona.py) for the
+exact behavior each setting produces.
+
 ## Model routing strategy
 
 OpenRouter requests are routed by task instead of using one model for every

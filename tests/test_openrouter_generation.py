@@ -506,3 +506,22 @@ def test_missing_openrouter_api_key_fails_clearly(monkeypatch):
 
     with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
         importlib.reload(bot)
+
+
+def test_persona_env_vars_are_wired_into_bots_system_prompt(monkeypatch):
+    bot = _load_bot(
+        monkeypatch,
+        JARVIS_OWNER_HONORIFIC="boss",
+        JARVIS_USE_MARVEL_REFERENCES="true",
+    )
+
+    assert bot.PERSONA_CONFIG.owner_honorific == "boss"
+    assert 'as "boss"' in bot.SYSTEM_PROMPT
+    assert "Stark-adjacent inspiration are" in bot.SYSTEM_PROMPT
+
+
+def test_bot_persona_plain_overrides_jarvis_system_prompt(monkeypatch):
+    bot = _load_bot(monkeypatch, BOT_PERSONA="plain")
+
+    assert "J.A.R.V.I.S." not in bot.SYSTEM_PROMPT
+    assert "friendly, practical AI assistant" in bot.SYSTEM_PROMPT
