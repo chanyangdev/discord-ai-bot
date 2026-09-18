@@ -325,7 +325,8 @@ def build_messages(
     prompt: str,
 ) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for turn in conversation_history.get(thread_id, ()):
+    history_snapshot = list(conversation_history.get(thread_id, ()))
+    for turn in history_snapshot:
         messages.append({"role": "user", "content": turn["user"]})
         messages.append({"role": "assistant", "content": turn["assistant"]})
     messages.append({"role": "user", "content": prompt})
