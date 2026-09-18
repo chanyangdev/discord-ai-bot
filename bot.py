@@ -6,17 +6,16 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import AsyncOpenAI
 
 from prompt_estimation import estimate_reservation_tokens
 from provider_usage import (
     ProviderUsage,
-    aggregate_provider_usage,
     usage_for_commit,
 )
 from quota_service import QuotaService
@@ -58,12 +57,9 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_FALLBACK_MODEL = os.getenv(
-    "GEMINI_FALLBACK_MODEL",
-    "gemini-3.5-flash-lite",
-)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "").strip()
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "discord-ai-bot").strip()
 TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
 SQLITE_PATH = os.getenv("SQLITE_PATH", str(Path("data") / "jarvis.db"))
 FREE_DAILY_TOKEN_LIMIT: int = _get_positive_int_env(
@@ -79,7 +75,7 @@ TOKEN_RESERVATION_TTL_SECONDS: int = _get_positive_int_env(
     "TOKEN_RESERVATION_TTL_SECONDS",
     900,
 )
-GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
 RESPONSE_CACHE_ENABLED = _get_bool_env("RESPONSE_CACHE_ENABLED", True)
 RESPONSE_CACHE_STATIC_TTL_SECONDS = _get_positive_int_env(
     "RESPONSE_CACHE_STATIC_TTL_SECONDS",
@@ -102,10 +98,31 @@ RESPONSE_CACHE_KEY_VERSION = os.getenv("RESPONSE_CACHE_KEY_VERSION", "v1")
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing from .env")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing from .env")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY is missing from .env")
 
-gemini = genai.Client(api_key=GEMINI_API_KEY)
+
+def _get_openrouter_models() -> list[str]:
+    value = os.getenv("OPENROUTER_MODELS")
+    if value is None:
+        raise RuntimeError("OPENROUTER_MODELS is missing from .env")
+
+    models = [model.strip() for model in value.split(",")]
+    if not 1 <= len(models) <= 3 or any(not model for model in models):
+        raise RuntimeError(
+            "OPENROUTER_MODELS must contain one to three non-empty model IDs."
+        )
+    return models
+
+OPENROUTER_MODELS = _get_openrouter_models()
+openrouter_headers = {"X-Title": OPENROUTER_APP_NAME}
+if OPENROUTER_SITE_URL:
+    openrouter_headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+openrouter = AsyncOpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1",
+    default_headers=openrouter_headers,
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -172,6 +189,7 @@ class Bot(discord.Client):
             self.response_cache_cleanup_task = None
         if self.token_usage_store is not None:
             await self.token_usage_store.close()
+        await openrouter.close()
         await super().close()
 
 
@@ -182,6 +200,9 @@ commands_synced = False
 MAX_TURNS = 8
 STREAM_EDIT_INTERVAL = 0.8
 DISCORD_MESSAGE_LIMIT = 1900
+PROVIDER_ERROR_MESSAGE = (
+    "Sorry, I couldn't generate a response right now. Please try again later."
+)
 SYSTEM_PROMPT = """
 You are a friendly, practical AI assistant in a Discord server.
 
@@ -218,13 +239,6 @@ def utc_date_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def build_generation_config() -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-    )
-
-
 async def _no_verified_paid_entitlement(user_id: int) -> bool:
     return False
 
@@ -244,15 +258,15 @@ def format_usage_response(usage: DailyUsage, daily_limit: int) -> str:
 async def reserve_user_tokens(
     user_id: int,
     guild_id: int,
-    contents: list[dict],
+    messages: list[dict[str, str]],
 ) -> int:
     if discord_client.token_usage_store is None:
         await discord_client.setup_hook()
 
     reserved_amount = estimate_reservation_tokens(
-        system_text=SYSTEM_PROMPT,
-        contents=contents,
-        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        system_text="",
+        contents=messages,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
     )
     await discord_client.token_usage_store.reserve_tokens(
         user_id,
@@ -306,33 +320,28 @@ def remove_bot_mention(message: discord.Message) -> str:
     return text.strip()
 
 
-def build_contents(thread_id: int | str, prompt: str) -> list[dict]:
-    contents: list[dict] = []
+def build_messages(
+    thread_id: int | str,
+    prompt: str,
+) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in conversation_history.get(thread_id, ()):
+        messages.append({"role": "user", "content": turn["user"]})
+        messages.append({"role": "assistant", "content": turn["assistant"]})
+    messages.append({"role": "user", "content": prompt})
+    return messages
 
-    for turn in conversation_history[thread_id]:
-        contents.append(
-            {
-                "role": "user",
-                "parts": [{"text": turn["user"]}],
-            }
-        )
-        contents.append(
-            {
-                "role": "model",
-                "parts": [{"text": turn["assistant"]}],
-            }
-        )
 
-    contents.append(
-        {
-            "role": "user",
-            "parts": [{"text": prompt}],
-        }
+def _usage_metadata(usage: object | None) -> SimpleNamespace | None:
+    if usage is None:
+        return None
+    return SimpleNamespace(
+        prompt_token_count=getattr(usage, "prompt_tokens", None),
+        candidates_token_count=getattr(usage, "completion_tokens", None),
     )
-    return contents
 
 
-async def stream_gemini_reply(
+async def stream_openrouter_reply(
     thread: discord.abc.Messageable,
     thread_id: int | str,
     prompt: str,
@@ -341,14 +350,11 @@ async def stream_gemini_reply(
     user_id: int,
     guild_id: int,
 ) -> str:
-    contents = build_contents(thread_id, prompt)
-    models_to_try = [GEMINI_MODEL]
-    if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
-        models_to_try.append(GEMINI_FALLBACK_MODEL)
+    messages = build_messages(thread_id, prompt)
 
     reserved_amount = 0
     try:
-        reserved_amount = await reserve_user_tokens(user_id, guild_id, contents)
+        reserved_amount = await reserve_user_tokens(user_id, guild_id, messages)
     except QuotaExceeded:
         await status_message.edit(
             content=(
@@ -358,146 +364,74 @@ async def stream_gemini_reply(
         )
         raise
 
-    round_usages: list[ProviderUsage] = []
-    for model_index, model_name in enumerate(models_to_try):
-        full_answer = ""
-        last_edit_time = 0.0
-        usage_metadata = None
-
-        try:
-            stream = await gemini.aio.models.generate_content_stream(
-                model=model_name,
-                contents=contents,
-                config=build_generation_config(),
-            )
-
-            async for chunk in stream:
-                if getattr(chunk, "usage_metadata", None) is not None:
-                    usage_metadata = chunk.usage_metadata
-
-                chunk_text = chunk.text or ""
-                if not chunk_text:
-                    continue
-
-                full_answer += chunk_text
-                now = time.monotonic()
-
-                if now - last_edit_time >= STREAM_EDIT_INTERVAL:
-                    preview = full_answer[:DISCORD_MESSAGE_LIMIT]
-                    if len(full_answer) > DISCORD_MESSAGE_LIMIT:
-                        preview = preview[:-3] + "..."
-
-                    await status_message.edit(content=preview)
-                    last_edit_time = now
-
-            if not full_answer:
-                full_answer = "I couldn't generate a response."
-
-            await status_message.edit(content=full_answer[:DISCORD_MESSAGE_LIMIT])
-
-            if len(full_answer) > DISCORD_MESSAGE_LIMIT:
-                await send_long_message(
-                    thread,
-                    full_answer[DISCORD_MESSAGE_LIMIT:],
-                )
-
-            round_usages.append(
-                usage_for_commit(
-                    type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
-                    fallback_prompt_tokens=max(
-                        0,
-                        reserved_amount - GEMINI_MAX_OUTPUT_TOKENS,
-                    ),
-                    fallback_completion_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                )
-            )
-            final_usage = aggregate_provider_usage(round_usages)
-            if final_usage is None:
-                raise RuntimeError("Provider usage reconciliation had no rounds")
-            await update_usage_after_response(
-                user_id,
-                guild_id,
-                reserved_amount,
-                final_usage,
-            )
-            return full_answer
-
-        except asyncio.CancelledError:
-            await release_user_tokens(user_id, guild_id, reserved_amount)
-            raise
-        except Exception as error:
-            error_text = str(error)
-            is_quota_error = (
-                "429" in error_text or "RESOURCE_EXHAUSTED" in error_text
-            )
-            can_try_fallback = (
-                model_index == 0
-                and len(models_to_try) > 1
-                and not full_answer
-                and is_quota_error
-            )
-
-            if can_try_fallback:
-                if usage_metadata is not None:
-                    round_usages.append(
-                        usage_for_commit(
-                            type(
-                                "UsageHolder",
-                                (),
-                                {"usage_metadata": usage_metadata},
-                            )(),
-                            fallback_prompt_tokens=max(
-                                0,
-                                reserved_amount - GEMINI_MAX_OUTPUT_TOKENS,
-                            ),
-                            fallback_completion_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                        )
-                    )
-                logger.info(
-                    "Primary model %s reached quota; trying fallback %s",
-                    model_name,
-                    models_to_try[1],
-                )
-                await status_message.edit(
-                    content="Primary model is busy — trying the fallback…"
-                )
-                continue
-
-            await release_user_tokens(user_id, guild_id, reserved_amount)
-            raise
-
-    raise RuntimeError("No Gemini model was available.")
-
-
-def ask_gemini(thread_id: int, prompt: str) -> str:
-    contents = build_contents(thread_id, prompt)
-    config = build_generation_config()
+    full_answer = ""
+    last_edit_time = 0.0
+    usage_metadata = None
 
     try:
-        response = gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=config,
-        )
-    except Exception as error:
-        error_text = str(error)
-
-        if "429" not in error_text and "RESOURCE_EXHAUSTED" not in error_text:
-            raise
-
-        logger.info(
-            "Primary model %s reached quota; trying fallback %s",
-            GEMINI_MODEL,
-            GEMINI_FALLBACK_MODEL,
+        stream = await openrouter.chat.completions.create(
+            model=OPENROUTER_MODELS[0],
+            messages=messages,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            stream=True,
+            stream_options={"include_usage": True},
+            extra_body={"models": OPENROUTER_MODELS},
         )
 
-        response = gemini.models.generate_content(
-            model=GEMINI_FALLBACK_MODEL,
-            contents=contents,
-            config=config,
-        )
+        async for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                usage_metadata = _usage_metadata(chunk.usage)
 
-    return response.text or "I couldn't generate a response."
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+
+            delta = getattr(choices[0], "delta", None)
+            chunk_text = getattr(delta, "content", None) or ""
+            if not chunk_text:
+                continue
+
+            full_answer += chunk_text
+            now = time.monotonic()
+
+            if now - last_edit_time >= STREAM_EDIT_INTERVAL:
+                preview = full_answer[:DISCORD_MESSAGE_LIMIT]
+                if len(full_answer) > DISCORD_MESSAGE_LIMIT:
+                    preview = preview[:-3] + "..."
+
+                await status_message.edit(content=preview)
+                last_edit_time = now
+
+        if not full_answer:
+            raise RuntimeError("OpenRouter returned an empty response.")
+
+        await status_message.edit(content=full_answer[:DISCORD_MESSAGE_LIMIT])
+
+        if len(full_answer) > DISCORD_MESSAGE_LIMIT:
+            await send_long_message(
+                thread,
+                full_answer[DISCORD_MESSAGE_LIMIT:],
+            )
+
+        final_usage = usage_for_commit(
+            type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
+            fallback_prompt_tokens=max(0, reserved_amount - MAX_OUTPUT_TOKENS),
+            fallback_completion_tokens=MAX_OUTPUT_TOKENS,
+        )
+        await update_usage_after_response(
+            user_id,
+            guild_id,
+            reserved_amount,
+            final_usage,
+        )
+        return full_answer
+
+    except asyncio.CancelledError:
+        await release_user_tokens(user_id, guild_id, reserved_amount)
+        raise
+    except Exception:
+        await release_user_tokens(user_id, guild_id, reserved_amount)
+        raise
 
 
 async def send_long_message(channel: discord.abc.Messageable, text: str) -> None:
@@ -517,7 +451,7 @@ async def answer_in_thread(
     try:
         async with thread.typing():
             status_message = await thread.send("Thinking…")
-            answer = await stream_gemini_reply(
+            answer = await stream_openrouter_reply(
                 thread,
                 thread.id,
                 prompt,
@@ -535,24 +469,11 @@ async def answer_in_thread(
     except QuotaExceeded:
         return
     except Exception as error:
-        logger.warning("Gemini request failed: %s", type(error).__name__)
-        error_text = str(error)
-
-        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
-            error_message = (
-                "I've reached the current Gemini usage limit. "
-                "Please wait and try again later."
-            )
-        else:
-            error_message = (
-                "Sorry, I couldn't contact the AI service. "
-                "Check the bot terminal for the error."
-            )
-
+        logger.warning("OpenRouter request failed: %s", type(error).__name__)
         if status_message is not None:
-            await status_message.edit(content=error_message)
+            await status_message.edit(content=PROVIDER_ERROR_MESSAGE)
         else:
-            await thread.send(error_message)
+            await thread.send(PROVIDER_ERROR_MESSAGE)
 
 
 @discord_client.event
@@ -560,7 +481,7 @@ async def on_ready() -> None:
     global commands_synced
 
     logger.info("Logged in as %s", discord_client.user)
-    logger.info("Using Gemini model: %s", GEMINI_MODEL)
+    logger.info("OpenRouter configured with %s models", len(OPENROUTER_MODELS))
 
     if commands_synced:
         return
@@ -606,7 +527,7 @@ async def handle_slash_ai_request(
 
     try:
         async with interaction.channel.typing():
-            answer = await stream_gemini_reply(
+            answer = await stream_openrouter_reply(
                 interaction.channel,
                 conversation_id,
                 prompt,
@@ -624,21 +545,8 @@ async def handle_slash_ai_request(
     except QuotaExceeded:
         return
     except Exception as error:
-        logger.warning("Gemini slash command failed: %s", type(error).__name__)
-        error_text = str(error)
-
-        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
-            error_message = (
-                "I've reached the current Gemini usage limit. "
-                "Please wait and try again later."
-            )
-        else:
-            error_message = (
-                "Sorry, I couldn't contact the AI service. "
-                "Check the bot terminal for the error."
-            )
-
-        await status_message.edit(content=error_message)
+        logger.warning("OpenRouter slash command failed: %s", type(error).__name__)
+        await status_message.edit(content=PROVIDER_ERROR_MESSAGE)
 
 
 @tree.command(
@@ -717,8 +625,8 @@ async def meta_command(
 ) -> None:
     if topic.value == "models":
         response = (
-            f"Configured primary model: `{GEMINI_MODEL}`\n"
-            f"Configured fallback model: `{GEMINI_FALLBACK_MODEL}`"
+            "Configured OpenRouter models:\n"
+            + "\n".join(f"- `{model}`" for model in OPENROUTER_MODELS)
         )
     elif topic.value == "memory":
         response = (
@@ -733,7 +641,7 @@ async def meta_command(
     else:
         response = (
             "The bot process is online and responding to commands. "
-            "This does not verify Gemini availability, quota, or provider health."
+            "This does not verify OpenRouter availability, quota, or provider health."
         )
 
     await interaction.response.send_message(
