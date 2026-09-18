@@ -99,6 +99,22 @@ def test_free_only_filters_paid_models_and_manual_disable():
     assert decision.paid_provider_allowed is False
 
 
+def test_free_only_uses_explicit_free_models_when_configured():
+    decision = make_policy(free_models=("openrouter/free",)).decide(
+        committed_microdollars=1_000_000,
+        reserved_microdollars=0,
+        normal_models=NORMAL_MODELS,
+    )
+
+    assert decision.mode is BudgetMode.FREE_ONLY
+    assert decision.allowed_models == ("openrouter/free",)
+
+
+def test_free_models_config_rejects_empty_list():
+    with pytest.raises(ValueError):
+        make_policy(free_models=())
+
+
 async def _run_controller(controller, active, started, release):
     async with controller.admit():
         active.append(1)

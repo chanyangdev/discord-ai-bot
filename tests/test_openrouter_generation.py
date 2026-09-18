@@ -36,13 +36,15 @@ class FakeThread:
         return self.status_message
 
 
-def _load_bot(monkeypatch):
+def _load_bot(monkeypatch, **extra_env):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv(
         "OPENROUTER_MODELS",
         "test/free-model:free,test/paid-model,test/reliable-model",
     )
+    for key, value in extra_env.items():
+        monkeypatch.setenv(key, value)
 
     import discord
 
@@ -213,7 +215,7 @@ def test_request_uses_stable_prefix_and_ordered_fallback_models(monkeypatch):
         "current prompt",
     ]
     assert captured["model"] == bot.OPENROUTER_MODELS[0]
-    assert captured["extra_body"]["models"] == bot.OPENROUTER_MODELS
+    assert captured["extra_body"]["models"] == list(bot.OPENROUTER_MODELS)
     assert 1 <= len(captured["extra_body"]["models"]) <= 3
 
 
@@ -319,3 +321,188 @@ async def _ignore_usage_update(*args, **kwargs):
 
 async def _ignore_release(*args, **kwargs):
     return None
+
+
+class _FakeGlobalStore:
+    def __init__(self, committed=0, reserved=0):
+        self.committed = committed
+        self.reserved = reserved
+
+    async def get_global_cost_usage(self):
+        import bot as bot_module
+
+        return bot_module.GlobalCostUsage(
+            "test-date",
+            committed_microdollars=self.committed,
+            reserved_microdollars=self.reserved,
+        )
+
+    async def reserve_global_cost(self, amount, budget):
+        return amount
+
+    async def reconcile_global_cost(self, reserved, actual, *, successful):
+        return reserved
+
+    async def release_global_cost(self, reserved):
+        return reserved
+
+
+def _capture_openrouter_request(bot, monkeypatch):
+    captured = {}
+
+    class FakeStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if hasattr(self, "sent"):
+                raise StopAsyncIteration
+            self.sent = True
+            return SimpleNamespace(
+                model=captured.get("model"),
+                usage=SimpleNamespace(prompt_tokens=4, completion_tokens=2),
+                choices=[
+                    SimpleNamespace(delta=SimpleNamespace(content="answer"))
+                ],
+            )
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return FakeStream()
+
+    monkeypatch.setattr(bot.openrouter.chat.completions, "create", fake_create)
+    monkeypatch.setattr(bot, "reserve_user_tokens", _reserve_without_storage)
+    monkeypatch.setattr(bot, "update_usage_after_response", _ignore_usage_update)
+    monkeypatch.setattr(bot, "release_user_tokens", _ignore_release)
+    return captured
+
+
+def test_live_meta_prompt_routes_to_research_models(monkeypatch):
+    bot = _load_bot(monkeypatch)
+    captured = _capture_openrouter_request(bot, monkeypatch)
+    bot.discord_client.token_usage_store = _FakeGlobalStore()
+
+    asyncio.run(
+        bot.stream_openrouter_reply(
+            FakeThread(),
+            "conversation",
+            "current prompt",
+            FakeStatusMessage(),
+            user_id=1,
+            guild_id=2,
+            category=bot.RequestCategory.LIVE_META,
+        )
+    )
+
+    assert captured["model"] == bot.LLM_CONFIG.research_models[0]
+    assert captured["extra_body"]["models"] == list(bot.LLM_CONFIG.research_models)
+
+
+def test_general_chat_prompt_routes_to_general_models(monkeypatch):
+    bot = _load_bot(monkeypatch)
+    captured = _capture_openrouter_request(bot, monkeypatch)
+    bot.discord_client.token_usage_store = _FakeGlobalStore()
+
+    asyncio.run(
+        bot.stream_openrouter_reply(
+            FakeThread(),
+            "conversation",
+            "current prompt",
+            FakeStatusMessage(),
+            user_id=1,
+            guild_id=2,
+            category=bot.RequestCategory.GENERAL_CHAT,
+        )
+    )
+
+    assert captured["model"] == bot.LLM_CONFIG.general_models[0]
+
+
+def test_cheap_budget_threshold_forces_general_route_for_live_meta(monkeypatch):
+    bot = _load_bot(monkeypatch)
+    captured = _capture_openrouter_request(bot, monkeypatch)
+    economy_committed = int(
+        bot.POLICY.config.daily_budget_microdollars
+        * float(bot.ECONOMY_THRESHOLD)
+    )
+    bot.discord_client.token_usage_store = _FakeGlobalStore(
+        committed=economy_committed
+    )
+
+    asyncio.run(
+        bot.stream_openrouter_reply(
+            FakeThread(),
+            "conversation",
+            "current prompt",
+            FakeStatusMessage(),
+            user_id=1,
+            guild_id=2,
+            category=bot.RequestCategory.LIVE_META,
+        )
+    )
+
+    assert captured["model"] == bot.LLM_CONFIG.general_models[0]
+
+
+def test_free_only_env_routes_everything_to_free_model(monkeypatch):
+    bot = _load_bot(monkeypatch, LLM_FREE_ONLY="true")
+    captured = _capture_openrouter_request(bot, monkeypatch)
+    bot.discord_client.token_usage_store = _FakeGlobalStore()
+
+    asyncio.run(
+        bot.stream_openrouter_reply(
+            FakeThread(),
+            "conversation",
+            "current prompt",
+            FakeStatusMessage(),
+            user_id=1,
+            guild_id=2,
+            category=bot.RequestCategory.LIVE_META,
+        )
+    )
+
+    assert captured["model"] == bot.LLM_CONFIG.free_model
+    assert captured["extra_body"]["models"] == [bot.LLM_CONFIG.free_model]
+
+
+def test_static_fact_bypasses_llm_when_local_resolver_has_an_answer(monkeypatch):
+    bot = _load_bot(monkeypatch)
+
+    async def fake_resolver(question):
+        return "local structured-data answer"
+
+    monkeypatch.setattr(bot, "default_static_fact_resolver", fake_resolver)
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("stream_openrouter_reply should not be called")
+
+    monkeypatch.setattr(bot, "stream_openrouter_reply", fail_if_called)
+    bot.discord_client.token_usage_store = _FakeGlobalStore()
+
+    status_message = FakeStatusMessage()
+    answer, from_cache = asyncio.run(
+        bot.generate_interactive_reply(
+            FakeThread(),
+            "conversation",
+            "what is the cooldown of this ability",
+            status_message,
+            user_id=1,
+            guild_id=2,
+        )
+    )
+
+    assert answer == "local structured-data answer"
+    assert from_cache is True
+
+
+def test_missing_openrouter_api_key_fails_clearly(monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    import discord
+
+    monkeypatch.setattr(discord.Client, "run", lambda *args, **kwargs: None)
+    import bot
+
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        importlib.reload(bot)
