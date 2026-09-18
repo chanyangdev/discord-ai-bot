@@ -1,0 +1,1 @@
+# Keeps the data directory in Git; SQLite databases remain ignored.
