@@ -41,7 +41,7 @@ def _load_bot(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv(
         "OPENROUTER_MODELS",
-        "test/free-model,test/paid-model,test/reliable-model",
+        "test/free-model:free,test/paid-model,test/reliable-model",
     )
 
     import discord
@@ -175,7 +175,21 @@ def test_request_uses_stable_prefix_and_ordered_fallback_models(monkeypatch):
         captured.update(kwargs)
         return FakeStream()
 
+    class FakeGlobalStore:
+        async def get_global_cost_usage(self):
+            return bot.GlobalCostUsage("test-date")
+
+        async def reserve_global_cost(self, amount, budget):
+            return amount
+
+        async def reconcile_global_cost(self, reserved, actual, *, successful):
+            return reserved
+
+        async def release_global_cost(self, reserved):
+            return reserved
+
     monkeypatch.setattr(bot.openrouter.chat.completions, "create", fake_create)
+    bot.discord_client.token_usage_store = FakeGlobalStore()
     monkeypatch.setattr(bot, "reserve_user_tokens", _reserve_without_storage)
     monkeypatch.setattr(bot, "update_usage_after_response", _ignore_usage_update)
     monkeypatch.setattr(bot, "release_user_tokens", _ignore_release)
@@ -201,6 +215,98 @@ def test_request_uses_stable_prefix_and_ordered_fallback_models(monkeypatch):
     assert captured["model"] == bot.OPENROUTER_MODELS[0]
     assert captured["extra_body"]["models"] == bot.OPENROUTER_MODELS
     assert 1 <= len(captured["extra_body"]["models"]) <= 3
+
+
+def test_partial_stream_is_not_retried(monkeypatch):
+    bot = _load_bot(monkeypatch)
+    calls = []
+
+    class FakeGlobalStore:
+        async def get_global_cost_usage(self):
+            return bot.GlobalCostUsage("test-date")
+
+        async def reserve_global_cost(self, amount, budget):
+            return amount
+
+        async def reconcile_global_cost(self, reserved, actual, *, successful):
+            return reserved
+
+        async def release_global_cost(self, reserved):
+            return reserved
+
+    class PartialStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not hasattr(self, "sent"):
+                self.sent = True
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content="partial answer")
+                        )
+                    ]
+                )
+            raise RuntimeError("stream interrupted")
+
+    async def fake_create(**kwargs):
+        calls.append(kwargs)
+        return PartialStream()
+
+    bot.discord_client.token_usage_store = FakeGlobalStore()
+    monkeypatch.setattr(bot.openrouter.chat.completions, "create", fake_create)
+    monkeypatch.setattr(bot, "reserve_user_tokens", _reserve_without_storage)
+    monkeypatch.setattr(bot, "release_user_tokens", _ignore_release)
+
+    with pytest.raises(RuntimeError, match="stream interrupted"):
+        asyncio.run(
+            bot.stream_openrouter_reply(
+                FakeThread(),
+                "conversation",
+                "current prompt",
+                FakeStatusMessage(),
+                user_id=1,
+                guild_id=2,
+            )
+        )
+
+    assert len(calls) == 1
+
+
+def test_dm_routes_to_shared_orchestrator_with_guild_zero(monkeypatch):
+    bot = _load_bot(monkeypatch)
+    captured = {}
+
+    class Message:
+        author = SimpleNamespace(bot=False, id=42)
+        guild = None
+        channel = FakeThread()
+        content = "dm prompt"
+
+    async def fake_answer(channel, prompt, *, user_id, guild_id, answer_type=None):
+        captured.update(
+            prompt=prompt,
+            user_id=user_id,
+            guild_id=guild_id,
+            answer_type=answer_type,
+        )
+
+    monkeypatch.setattr(bot, "answer_in_thread", fake_answer)
+    asyncio.run(bot.on_message(Message()))
+
+    assert captured == {
+        "prompt": "dm prompt",
+        "user_id": 42,
+        "guild_id": 0,
+        "answer_type": None,
+    }
+
+
+def test_owner_only_rejects_dm_interactions(monkeypatch):
+    bot = _load_bot(monkeypatch)
+    interaction = SimpleNamespace(guild_id=None, user=SimpleNamespace(id=1))
+    assert asyncio.run(bot.owner_only(interaction)) is False
 
 
 async def _reserve_without_storage(*args, **kwargs):

@@ -5,6 +5,7 @@ import os
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,14 +14,35 @@ from discord import app_commands
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+from degradation import (
+    AdmissionController,
+    AdmissionError,
+    AdmissionShutdown,
+    BudgetMode,
+    BudgetUnavailable,
+    DegradationPolicy,
+    DegradationDecision,
+    DegradationPolicyConfig,
+    is_free_model,
+    parse_economy_models,
+)
+from free_fallbacks import UnavailableLocalFallback
 from prompt_estimation import estimate_reservation_tokens
 from provider_usage import (
     ProviderUsage,
     usage_for_commit,
 )
 from quota_service import QuotaService
-from response_cache import ResponseCache, parse_canonical_patch_version
-from storage import DailyUsage, QuotaExceeded, TokenUsageStore
+from response_cache import (
+    AnswerType,
+    CachedResponse,
+    ResponseCache,
+    build_cache_key,
+    decide_cache_policy,
+    parse_canonical_patch_version,
+    question_hash,
+)
+from storage import DailyUsage, GlobalCostUsage, QuotaExceeded, TokenUsageStore
 
 load_dotenv()
 
@@ -41,7 +63,7 @@ def _get_bool_env(name: str, default: bool) -> bool:
 def _get_positive_int_env(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
-        return default
+        value = str(default)
 
     try:
         parsed = int(value)
@@ -51,6 +73,33 @@ def _get_positive_int_env(name: str, default: int) -> int:
     if parsed <= 0:
         raise RuntimeError(f"{name} must be a positive integer.")
     return parsed
+
+
+def _get_decimal_env(name: str, default: str) -> Decimal:
+    value = os.getenv(name, default)
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a decimal value.") from exc
+    if not parsed.is_finite():
+        raise RuntimeError(f"{name} must be finite.")
+    return parsed
+
+
+def _get_positive_float_env(name: str, default: str) -> float:
+    value = _get_decimal_env(name, default)
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive.")
+    return float(value)
+
+
+def _decimal_to_microdollars(name: str, value: Decimal) -> int:
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive.")
+    scaled = value * Decimal(1_000_000)
+    if scaled != scaled.to_integral_value():
+        raise RuntimeError(f"{name} must have at most six decimal places.")
+    return int(scaled)
 
 logger = logging.getLogger("jarvis")
 if not logger.handlers:
@@ -75,7 +124,33 @@ TOKEN_RESERVATION_TTL_SECONDS: int = _get_positive_int_env(
     "TOKEN_RESERVATION_TTL_SECONDS",
     900,
 )
-MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+NORMAL_MAX_OUTPUT_TOKENS = _get_positive_int_env(
+    "NORMAL_MAX_OUTPUT_TOKENS",
+    os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"),
+)
+ECONOMY_MAX_OUTPUT_TOKENS = _get_positive_int_env(
+    "ECONOMY_MAX_OUTPUT_TOKENS",
+    str(min(NORMAL_MAX_OUTPUT_TOKENS, 512)),
+)
+MAX_OUTPUT_TOKENS = NORMAL_MAX_OUTPUT_TOKENS
+DAILY_AI_BUDGET_MICRODOLLARS = _decimal_to_microdollars(
+    "DAILY_AI_BUDGET_USD", _get_decimal_env("DAILY_AI_BUDGET_USD", "1.00")
+)
+MAX_REQUEST_COST_MICRODOLLARS = _decimal_to_microdollars(
+    "MAX_REQUEST_COST_USD", _get_decimal_env("MAX_REQUEST_COST_USD", "0.01")
+)
+CACHE_FIRST_THRESHOLD = _get_decimal_env("CACHE_FIRST_THRESHOLD", "0.60")
+ECONOMY_THRESHOLD = _get_decimal_env("ECONOMY_THRESHOLD", "0.80")
+FREE_ONLY_THRESHOLD = _get_decimal_env("FREE_ONLY_THRESHOLD", "1.00")
+PAID_LLM_ENABLED = _get_bool_env("PAID_LLM_ENABLED", True)
+MAX_CONCURRENT_AI_REQUESTS = _get_positive_int_env("MAX_CONCURRENT_AI_REQUESTS", 2)
+MAX_AI_QUEUE_SIZE = _get_positive_int_env("MAX_AI_QUEUE_SIZE", 8)
+AI_QUEUE_TIMEOUT_SECONDS = _get_positive_float_env(
+    "AI_QUEUE_TIMEOUT_SECONDS", "30"
+)
+AI_SHUTDOWN_TIMEOUT_SECONDS = _get_positive_float_env(
+    "AI_SHUTDOWN_TIMEOUT_SECONDS", "5"
+)
 RESPONSE_CACHE_ENABLED = _get_bool_env("RESPONSE_CACHE_ENABLED", True)
 RESPONSE_CACHE_STATIC_TTL_SECONDS = _get_positive_int_env(
     "RESPONSE_CACHE_STATIC_TTL_SECONDS",
@@ -94,6 +169,9 @@ RESPONSE_CACHE_CLEANUP_INTERVAL_SECONDS = _get_positive_int_env(
     21600,
 )
 RESPONSE_CACHE_KEY_VERSION = os.getenv("RESPONSE_CACHE_KEY_VERSION", "v1")
+RESPONSE_CACHE_PATCH_VERSION = parse_canonical_patch_version(
+    os.getenv("RESPONSE_CACHE_PATCH_VERSION", "0.0")
+)
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing from .env")
@@ -115,6 +193,43 @@ def _get_openrouter_models() -> list[str]:
     return models
 
 OPENROUTER_MODELS = _get_openrouter_models()
+
+
+def _get_economy_models() -> tuple[str, ...]:
+    value = os.getenv("ECONOMY_MODELS")
+    if value is None:
+        models = tuple(model for model in OPENROUTER_MODELS if is_free_model(model))
+        if not models:
+            raise RuntimeError(
+                "ECONOMY_MODELS is required when OPENROUTER_MODELS has no free model."
+            )
+        return models
+    try:
+        return parse_economy_models(value)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+POLICY = DegradationPolicy(
+    DegradationPolicyConfig(
+        daily_budget_microdollars=DAILY_AI_BUDGET_MICRODOLLARS,
+        cache_first_threshold=CACHE_FIRST_THRESHOLD,
+        economy_threshold=ECONOMY_THRESHOLD,
+        free_only_threshold=FREE_ONLY_THRESHOLD,
+        max_request_cost_microdollars=MAX_REQUEST_COST_MICRODOLLARS,
+        normal_max_output_tokens=NORMAL_MAX_OUTPUT_TOKENS,
+        economy_max_output_tokens=ECONOMY_MAX_OUTPUT_TOKENS,
+        economy_models=_get_economy_models(),
+        paid_llm_enabled=PAID_LLM_ENABLED,
+    )
+)
+AI_ADMISSION = AdmissionController(
+    MAX_CONCURRENT_AI_REQUESTS,
+    MAX_AI_QUEUE_SIZE,
+    AI_QUEUE_TIMEOUT_SECONDS,
+    AI_SHUTDOWN_TIMEOUT_SECONDS,
+)
+LOCAL_FALLBACK = UnavailableLocalFallback()
 openrouter_headers = {"X-Title": OPENROUTER_APP_NAME}
 if OPENROUTER_SITE_URL:
     openrouter_headers["HTTP-Referer"] = OPENROUTER_SITE_URL
@@ -182,6 +297,10 @@ class Bot(discord.Client):
                 logger.warning("Response cache cleanup failed; will retry")
 
     async def close(self) -> None:
+        try:
+            await AI_ADMISSION.close()
+        except Exception:
+            logger.warning("AI admission shutdown failed")
         if self.response_cache_cleanup_task is not None:
             self.response_cache_cleanup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -203,6 +322,10 @@ DISCORD_MESSAGE_LIMIT = 1900
 PROVIDER_ERROR_MESSAGE = (
     "Sorry, I couldn't generate a response right now. Please try again later."
 )
+BUDGET_EXHAUSTED_MESSAGE = (
+    "The daily AI budget is exhausted. Free features remain available; please try again tomorrow."
+)
+QUEUE_RETRY_MESSAGE = "High traffic right now. Please try again later."
 SYSTEM_PROMPT = """
 You are a friendly, practical AI assistant in a Discord server.
 
@@ -259,6 +382,7 @@ async def reserve_user_tokens(
     user_id: int,
     guild_id: int,
     messages: list[dict[str, str]],
+    max_output_tokens: int,
 ) -> int:
     if discord_client.token_usage_store is None:
         await discord_client.setup_hook()
@@ -266,7 +390,7 @@ async def reserve_user_tokens(
     reserved_amount = estimate_reservation_tokens(
         system_text="",
         contents=messages,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
+        max_output_tokens=max_output_tokens,
     )
     await discord_client.token_usage_store.reserve_tokens(
         user_id,
@@ -339,7 +463,136 @@ def _usage_metadata(usage: object | None) -> SimpleNamespace | None:
     return SimpleNamespace(
         prompt_token_count=getattr(usage, "prompt_tokens", None),
         candidates_token_count=getattr(usage, "completion_tokens", None),
+        cost=getattr(usage, "cost", None),
     )
+
+
+def _cost_microdollars(usage_metadata: object | None) -> int | None:
+    raw_cost = getattr(usage_metadata, "cost", None)
+    if raw_cost is None:
+        return None
+    try:
+        cost = Decimal(str(raw_cost)) * Decimal(1_000_000)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if cost < 0 or cost != cost.to_integral_value():
+        return None
+    return int(cost)
+
+
+async def _current_policy() -> tuple[GlobalCostUsage, DegradationDecision]:
+    if discord_client.token_usage_store is None:
+        await discord_client.setup_hook()
+    usage = await discord_client.token_usage_store.get_global_cost_usage()
+    decision = POLICY.decide(
+        committed_microdollars=usage.committed_microdollars,
+        reserved_microdollars=usage.reserved_microdollars,
+        normal_models=tuple(OPENROUTER_MODELS),
+        paid_path_disabled=not POLICY.config.paid_llm_enabled,
+    )
+    logger.info("degradation_mode=%s reason=%s", decision.mode, decision.reason)
+    return usage, decision
+
+
+async def _release_global_cost(reserved_microdollars: int) -> None:
+    if reserved_microdollars and discord_client.token_usage_store is not None:
+        await discord_client.token_usage_store.release_global_cost(
+            reserved_microdollars
+        )
+
+
+async def _safe_cache_get(
+    cache: ResponseCache,
+    cache_key: str,
+) -> tuple[CachedResponse | None, bool]:
+    try:
+        return await cache.get(cache_key), False
+    except Exception:
+        logger.warning("response_cache_read_failed")
+        return None, True
+
+
+async def _deliver_cached_answer(
+    thread: discord.abc.Messageable,
+    status_message: discord.Message,
+    answer: str,
+) -> None:
+    await status_message.edit(content=answer[:DISCORD_MESSAGE_LIMIT])
+    if len(answer) > DISCORD_MESSAGE_LIMIT:
+        await send_long_message(thread, answer[DISCORD_MESSAGE_LIMIT:])
+
+
+async def generate_interactive_reply(
+    thread: discord.abc.Messageable,
+    thread_id: int | str,
+    prompt: str,
+    status_message: discord.Message,
+    *,
+    user_id: int,
+    guild_id: int,
+    answer_type: AnswerType | None = None,
+) -> tuple[str, bool]:
+    if discord_client.response_cache is None:
+        await discord_client.setup_hook()
+    cache = discord_client.response_cache
+    _, decision = await _current_policy()
+    policy = decide_cache_policy(
+        answer_type or AnswerType.UNKNOWN,
+        depends_on_conversation_history=answer_type is None,
+    )
+    if not policy.cacheable or cache is None:
+        return await stream_openrouter_reply(
+            thread,
+            thread_id,
+            prompt,
+            status_message,
+            user_id=user_id,
+            guild_id=guild_id,
+        ), False
+
+    cache_key = build_cache_key(prompt, RESPONSE_CACHE_PATCH_VERSION)
+    cached, _ = await _safe_cache_get(cache, cache_key)
+    if cached is not None:
+        await _deliver_cached_answer(thread, status_message, cached.answer)
+        return cached.answer, True
+    if decision.mode is BudgetMode.FREE_ONLY:
+        local_result = await LOCAL_FALLBACK.lookup(
+            prompt,
+            patch_version=RESPONSE_CACHE_PATCH_VERSION,
+        )
+        if local_result is not None:
+            await _deliver_cached_answer(thread, status_message, local_result.answer)
+            return local_result.answer, True
+        await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
+        raise BudgetUnavailable("cache_miss")
+
+    async with cache._lock_for_key(cache_key):
+        cached, _ = await _safe_cache_get(cache, cache_key)
+        if cached is not None:
+            await _deliver_cached_answer(thread, status_message, cached.answer)
+            return cached.answer, True
+
+        answer = await stream_openrouter_reply(
+            thread,
+            thread_id,
+            prompt,
+            status_message,
+            user_id=user_id,
+            guild_id=guild_id,
+        )
+        try:
+            await cache.put(
+                cache_key,
+                RESPONSE_CACHE_PATCH_VERSION,
+                question_hash(prompt),
+                answer,
+                [],
+                policy.answer_type,
+                policy.ttl_seconds or 1,
+            )
+        except Exception:
+            logger.warning("response_cache_write_failed")
+        return answer, False
 
 
 async def stream_openrouter_reply(
@@ -353,86 +606,149 @@ async def stream_openrouter_reply(
 ) -> str:
     messages = build_messages(thread_id, prompt)
 
-    reserved_amount = 0
-    try:
-        reserved_amount = await reserve_user_tokens(user_id, guild_id, messages)
-    except QuotaExceeded:
-        await status_message.edit(
-            content=(
-                "You’ve reached your daily token limit. "
-                "Cached answers still work; please try again after the 00:00 UTC reset."
-            )
-        )
-        raise
-
-    full_answer = ""
-    last_edit_time = 0.0
-    usage_metadata = None
+    _, decision = await _current_policy()
+    if decision.mode is BudgetMode.FREE_ONLY or not decision.allowed_models:
+        await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
+        raise BudgetUnavailable(decision.reason)
 
     try:
-        stream = await openrouter.chat.completions.create(
-            model=OPENROUTER_MODELS[0],
-            messages=messages,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            stream=True,
-            stream_options={"include_usage": True},
-            extra_body={"models": OPENROUTER_MODELS},
-        )
+        admission = AI_ADMISSION.admit(status_message)
+        async with admission:
+            _, decision = await _current_policy()
+            if decision.mode is BudgetMode.FREE_ONLY or not decision.allowed_models:
+                await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
+                raise BudgetUnavailable(decision.reason)
 
-        async for chunk in stream:
-            if getattr(chunk, "usage", None) is not None:
-                usage_metadata = _usage_metadata(chunk.usage)
+            global_reserved = 0
+            if decision.paid_provider_allowed:
+                try:
+                    global_reserved = await discord_client.token_usage_store.reserve_global_cost(
+                        POLICY.config.max_request_cost_microdollars,
+                        POLICY.config.daily_budget_microdollars,
+                    )
+                except QuotaExceeded:
+                    _, decision = await _current_policy()
+                    if not decision.allowed_models:
+                        await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
+                        raise BudgetUnavailable("global_budget")
+                    decision = POLICY.decide(
+                        committed_microdollars=POLICY.config.daily_budget_microdollars,
+                        reserved_microdollars=0,
+                        normal_models=tuple(OPENROUTER_MODELS),
+                        paid_path_disabled=True,
+                    )
+                    if not decision.allowed_models:
+                        await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
+                        raise BudgetUnavailable("global_budget")
 
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
+            reserved_amount = 0
+            try:
+                reserved_amount = await reserve_user_tokens(
+                    user_id,
+                    guild_id,
+                    messages,
+                    decision.max_output_tokens,
+                )
+            except BaseException:
+                await _release_global_cost(global_reserved)
+                raise
 
-            delta = getattr(choices[0], "delta", None)
-            chunk_text = getattr(delta, "content", None) or ""
-            if not chunk_text:
-                continue
+            full_answer = ""
+            last_edit_time = 0.0
+            provider_started = False
+            global_reconciled = False
+            usage_metadata = None
+            try:
+                provider_started = True
+                stream = await openrouter.chat.completions.create(
+                    model=decision.allowed_models[0],
+                    messages=messages,
+                    max_tokens=decision.max_output_tokens,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    extra_body={"models": list(decision.allowed_models)},
+                )
 
-            full_answer += chunk_text
-            now = time.monotonic()
+                async for chunk in stream:
+                    if getattr(chunk, "usage", None) is not None:
+                        usage_metadata = _usage_metadata(chunk.usage)
 
-            if now - last_edit_time >= STREAM_EDIT_INTERVAL:
-                preview = full_answer[:DISCORD_MESSAGE_LIMIT]
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+
+                    delta = getattr(choices[0], "delta", None)
+                    chunk_text = getattr(delta, "content", None) or ""
+                    if not chunk_text:
+                        continue
+
+                    full_answer += chunk_text
+                    now = time.monotonic()
+
+                    if now - last_edit_time >= STREAM_EDIT_INTERVAL:
+                        preview = full_answer[:DISCORD_MESSAGE_LIMIT]
+                        if len(full_answer) > DISCORD_MESSAGE_LIMIT:
+                            preview = preview[:-3] + "..."
+
+                        await status_message.edit(content=preview)
+                        last_edit_time = now
+
+                if not full_answer:
+                    raise RuntimeError("OpenRouter returned an empty response.")
+
+                await status_message.edit(content=full_answer[:DISCORD_MESSAGE_LIMIT])
+
                 if len(full_answer) > DISCORD_MESSAGE_LIMIT:
-                    preview = preview[:-3] + "..."
+                    await send_long_message(
+                        thread,
+                        full_answer[DISCORD_MESSAGE_LIMIT:],
+                    )
 
-                await status_message.edit(content=preview)
-                last_edit_time = now
+                final_usage = usage_for_commit(
+                    type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
+                    fallback_prompt_tokens=max(
+                        0, reserved_amount - decision.max_output_tokens
+                    ),
+                    fallback_completion_tokens=decision.max_output_tokens,
+                )
+                if global_reserved:
+                    await discord_client.token_usage_store.reconcile_global_cost(
+                        global_reserved,
+                        _cost_microdollars(usage_metadata),
+                        successful=True,
+                    )
+                    global_reconciled = True
+                await update_usage_after_response(
+                    user_id,
+                    guild_id,
+                    reserved_amount,
+                    final_usage,
+                )
+                return full_answer
 
-        if not full_answer:
-            raise RuntimeError("OpenRouter returned an empty response.")
-
-        await status_message.edit(content=full_answer[:DISCORD_MESSAGE_LIMIT])
-
-        if len(full_answer) > DISCORD_MESSAGE_LIMIT:
-            await send_long_message(
-                thread,
-                full_answer[DISCORD_MESSAGE_LIMIT:],
-            )
-
-        final_usage = usage_for_commit(
-            type("UsageHolder", (), {"usage_metadata": usage_metadata})(),
-            fallback_prompt_tokens=max(0, reserved_amount - MAX_OUTPUT_TOKENS),
-            fallback_completion_tokens=MAX_OUTPUT_TOKENS,
-        )
-        await update_usage_after_response(
-            user_id,
-            guild_id,
-            reserved_amount,
-            final_usage,
-        )
-        return full_answer
-
-    except asyncio.CancelledError:
-        await release_user_tokens(user_id, guild_id, reserved_amount)
-        raise
-    except Exception:
-        await release_user_tokens(user_id, guild_id, reserved_amount)
-        raise
+            except asyncio.CancelledError:
+                await release_user_tokens(user_id, guild_id, reserved_amount)
+                if global_reserved and not global_reconciled:
+                    if provider_started:
+                        await discord_client.token_usage_store.reconcile_global_cost(
+                            global_reserved, None, successful=False
+                        )
+                    else:
+                        await _release_global_cost(global_reserved)
+                raise
+            except Exception:
+                await release_user_tokens(user_id, guild_id, reserved_amount)
+                if global_reserved and not global_reconciled:
+                    if provider_started:
+                        await discord_client.token_usage_store.reconcile_global_cost(
+                            global_reserved, None, successful=False
+                        )
+                    else:
+                        await _release_global_cost(global_reserved)
+                raise
+    except AdmissionError as error:
+        await status_message.edit(content=QUEUE_RETRY_MESSAGE)
+        raise error
 
 
 async def send_long_message(channel: discord.abc.Messageable, text: str) -> None:
@@ -446,28 +762,30 @@ async def answer_in_thread(
     *,
     user_id: int,
     guild_id: int,
+    answer_type: AnswerType | None = None,
 ) -> None:
     status_message = None
 
     try:
         async with thread.typing():
             status_message = await thread.send("Thinking…")
-            answer = await stream_openrouter_reply(
+            answer, from_cache = await generate_interactive_reply(
                 thread,
                 thread.id,
                 prompt,
                 status_message,
                 user_id=user_id,
                 guild_id=guild_id,
+                answer_type=answer_type,
             )
 
-        conversation_history[thread.id].append(
-            {
-                "user": prompt,
-                "assistant": answer,
-            }
-        )
+        if not from_cache:
+            conversation_history[thread.id].append(
+                {"user": prompt, "assistant": answer}
+            )
     except QuotaExceeded:
+        return
+    except (AdmissionError, AdmissionShutdown, BudgetUnavailable):
         return
     except Exception as error:
         logger.warning("OpenRouter request failed: %s", type(error).__name__)
@@ -513,6 +831,7 @@ def slash_conversation_id(interaction: discord.Interaction) -> str:
 async def handle_slash_ai_request(
     interaction: discord.Interaction,
     prompt: str,
+    answer_type: AnswerType | None = None,
 ) -> None:
     if interaction.channel is None:
         await interaction.response.send_message(
@@ -528,22 +847,23 @@ async def handle_slash_ai_request(
 
     try:
         async with interaction.channel.typing():
-            answer = await stream_openrouter_reply(
+            answer, from_cache = await generate_interactive_reply(
                 interaction.channel,
                 conversation_id,
                 prompt,
                 status_message,
                 user_id=interaction.user.id,
                 guild_id=guild_id,
+                answer_type=answer_type,
             )
 
-        conversation_history[conversation_id].append(
-            {
-                "user": prompt,
-                "assistant": answer,
-            }
-        )
+        if not from_cache:
+            conversation_history[conversation_id].append(
+                {"user": prompt, "assistant": answer}
+            )
     except QuotaExceeded:
+        return
+    except (AdmissionError, AdmissionShutdown, BudgetUnavailable):
         return
     except Exception as error:
         logger.warning("OpenRouter slash command failed: %s", type(error).__name__)
@@ -582,6 +902,23 @@ async def usage_command(interaction: discord.Interaction) -> None:
     )
 
 
+@tree.command(name="help", description="Show safe local bot help")
+async def help_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        "Use `/ask`, `/build`, `/usage`, `/meta`, or `/budget-status`. "
+        "You can also mention the bot to start a thread.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="health", description="Show local bot health")
+async def health_command(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"Bot process is online. AI mode: `{(await _current_policy())[1].mode}`.",
+        ephemeral=True,
+    )
+
+
 @tree.command(
     name="build",
     description="Ask for general bot-building guidance",
@@ -598,7 +935,11 @@ async def build_command(
         "metadata was explicitly supplied by the application.\n\n"
         f"Question: {question.strip()}"
     )
-    await handle_slash_ai_request(interaction, build_prompt)
+    await handle_slash_ai_request(
+        interaction,
+        build_prompt,
+        answer_type=AnswerType.BUILD_META,
+    )
 
 
 META_CHOICES = [
@@ -610,8 +951,38 @@ META_CHOICES = [
 
 
 async def owner_only(interaction: discord.Interaction) -> bool:
+    if getattr(interaction, "guild_id", "guild-context") is None:
+        return False
     application = await discord_client.application_info()
     return interaction.user.id == application.owner.id
+
+
+@tree.command(
+    name="budget-status",
+    description="Show the current AI budget and queue status",
+)
+@app_commands.check(owner_only)
+async def budget_status_command(interaction: discord.Interaction) -> None:
+    if discord_client.token_usage_store is None:
+        await discord_client.setup_hook()
+    usage = await discord_client.token_usage_store.get_global_cost_usage()
+    _, decision = await _current_policy()
+    budget = Decimal(POLICY.config.daily_budget_microdollars) / Decimal(1_000_000)
+    committed = Decimal(usage.committed_microdollars) / Decimal(1_000_000)
+    reserved = Decimal(usage.reserved_microdollars) / Decimal(1_000_000)
+    utilization = decision.utilization_ratio * Decimal(100)
+    await interaction.response.send_message(
+        "**AI budget status**\n"
+        f"Mode: `{decision.mode}`\n"
+        f"Utilization: `{utilization:.2f}%`\n"
+        f"Committed: `${committed:.6f}` / `${budget:.6f}`\n"
+        f"Reserved: `${reserved:.6f}`\n"
+        f"Active requests: `{AI_ADMISSION.active}`\n"
+        f"Queued requests: `{AI_ADMISSION.waiting}`\n"
+        f"Output limit: `{decision.max_output_tokens}`\n"
+        f"Allowed models: `{len(decision.allowed_models)}`",
+        ephemeral=True,
+    )
 
 
 @tree.command(
@@ -685,6 +1056,17 @@ async def invalidate_cache_command(
 @discord_client.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
+        return
+
+    if message.guild is None and not isinstance(message.channel, discord.Thread):
+        prompt = message.content.strip()
+        if prompt:
+            await answer_in_thread(
+                message.channel,
+                prompt,
+                user_id=message.author.id,
+                guild_id=0,
+            )
         return
 
     if isinstance(message.channel, discord.Thread):

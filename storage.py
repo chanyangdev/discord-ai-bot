@@ -29,6 +29,15 @@ class DailyUsage:
     updated_at: int = 0
 
 
+@dataclass(frozen=True)
+class GlobalCostUsage:
+    usage_date: str
+    committed_microdollars: int = 0
+    reserved_microdollars: int = 0
+    successful_paid_requests: int = 0
+    updated_at: int = 0
+
+
 def _validate_non_negative_int(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -148,8 +157,33 @@ class TokenUsageStore:
                 "ON response_cache (expires_at)"
             )
             await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS global_provider_cost_usage (
+                    usage_date TEXT PRIMARY KEY,
+                    committed_microdollars INTEGER NOT NULL DEFAULT 0
+                        CHECK (committed_microdollars >= 0),
+                    reserved_microdollars INTEGER NOT NULL DEFAULT 0
+                        CHECK (reserved_microdollars >= 0),
+                    successful_paid_requests INTEGER NOT NULL DEFAULT 0
+                        CHECK (successful_paid_requests >= 0),
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            await connection.execute(
                 "UPDATE daily_user_token_usage SET reserved_tokens = 0 "
                 "WHERE reserved_tokens > 0"
+            )
+            await connection.execute(
+                """
+                UPDATE global_provider_cost_usage
+                SET committed_microdollars =
+                        committed_microdollars + reserved_microdollars,
+                    reserved_microdollars = 0,
+                    updated_at = ?
+                WHERE reserved_microdollars > 0
+                """,
+                (_utc_timestamp(),),
             )
             await connection.commit()
         self._initialized = True
@@ -186,6 +220,161 @@ class TokenUsageStore:
             )
             row = await cursor.fetchone()
         return None if row is None else int(row[0])
+
+    async def get_global_cost_usage(self) -> GlobalCostUsage:
+        usage_date = _utc_date()
+        async with connect_sqlite(self.db_path) as connection:
+            await _prepare_connection(connection)
+            await connection.execute(
+                """
+                INSERT INTO global_provider_cost_usage (usage_date, updated_at)
+                VALUES (?, ?)
+                ON CONFLICT(usage_date) DO NOTHING
+                """,
+                (usage_date, _utc_timestamp()),
+            )
+            await connection.commit()
+            cursor = await connection.execute(
+                """
+                SELECT committed_microdollars, reserved_microdollars,
+                       successful_paid_requests, updated_at
+                FROM global_provider_cost_usage
+                WHERE usage_date = ?
+                """,
+                (usage_date,),
+            )
+            row = await cursor.fetchone()
+        return GlobalCostUsage(usage_date, *map(int, row))
+
+    async def reserve_global_cost(
+        self,
+        amount_microdollars: int,
+        daily_budget_microdollars: int,
+    ) -> int:
+        amount_microdollars = _validate_positive_int(
+            "amount_microdollars", amount_microdollars
+        )
+        daily_budget_microdollars = _validate_positive_int(
+            "daily_budget_microdollars", daily_budget_microdollars
+        )
+        usage_date = _utc_date()
+        async with connect_sqlite(self.db_path) as connection:
+            try:
+                await _prepare_connection(connection)
+                await connection.execute("BEGIN IMMEDIATE")
+                timestamp = _utc_timestamp()
+                await connection.execute(
+                    """
+                    INSERT INTO global_provider_cost_usage (usage_date, updated_at)
+                    VALUES (?, ?)
+                    ON CONFLICT(usage_date) DO NOTHING
+                    """,
+                    (usage_date, timestamp),
+                )
+                cursor = await connection.execute(
+                    """
+                    UPDATE global_provider_cost_usage
+                    SET reserved_microdollars = reserved_microdollars + ?,
+                        updated_at = ?
+                    WHERE usage_date = ?
+                      AND committed_microdollars + reserved_microdollars + ? <= ?
+                    """,
+                    (
+                        amount_microdollars,
+                        timestamp,
+                        usage_date,
+                        amount_microdollars,
+                        daily_budget_microdollars,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise QuotaExceeded("Global daily AI budget reached.")
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+        return amount_microdollars
+
+    async def reconcile_global_cost(
+        self,
+        reserved_microdollars: int,
+        actual_microdollars: int | None,
+        *,
+        successful: bool,
+    ) -> int:
+        reserved_microdollars = _validate_non_negative_int(
+            "reserved_microdollars", reserved_microdollars
+        )
+        if actual_microdollars is not None:
+            actual_microdollars = _validate_non_negative_int(
+                "actual_microdollars", actual_microdollars
+            )
+        committed = (
+            actual_microdollars
+            if actual_microdollars is not None
+            else reserved_microdollars
+        )
+        usage_date = _utc_date()
+        async with connect_sqlite(self.db_path) as connection:
+            try:
+                await _prepare_connection(connection)
+                await connection.execute("BEGIN IMMEDIATE")
+                cursor = await connection.execute(
+                    """
+                    UPDATE global_provider_cost_usage
+                    SET committed_microdollars = committed_microdollars + ?,
+                        reserved_microdollars = reserved_microdollars - ?,
+                        successful_paid_requests = successful_paid_requests + ?,
+                        updated_at = ?
+                    WHERE usage_date = ? AND reserved_microdollars >= ?
+                    """,
+                    (
+                        committed,
+                        reserved_microdollars,
+                        1 if successful else 0,
+                        _utc_timestamp(),
+                        usage_date,
+                        reserved_microdollars,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LookupError("Expected global cost row is missing")
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+        return committed
+
+    async def release_global_cost(self, reserved_microdollars: int) -> int:
+        reserved_microdollars = _validate_non_negative_int(
+            "reserved_microdollars", reserved_microdollars
+        )
+        usage_date = _utc_date()
+        async with connect_sqlite(self.db_path) as connection:
+            try:
+                await _prepare_connection(connection)
+                await connection.execute("BEGIN IMMEDIATE")
+                cursor = await connection.execute(
+                    """
+                    UPDATE global_provider_cost_usage
+                    SET reserved_microdollars = reserved_microdollars - ?,
+                        updated_at = ?
+                    WHERE usage_date = ? AND reserved_microdollars >= ?
+                    """,
+                    (
+                        reserved_microdollars,
+                        _utc_timestamp(),
+                        usage_date,
+                        reserved_microdollars,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LookupError("Expected global cost row is missing")
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+        return reserved_microdollars
 
     async def reserve_tokens(
         self,
