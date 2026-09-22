@@ -27,6 +27,8 @@ def test_response_cache_defaults(monkeypatch):
     monkeypatch.delenv("FREE_DAILY_TOKEN_LIMIT", raising=False)
     monkeypatch.delenv("PREMIUM_DAILY_TOKEN_LIMIT", raising=False)
     monkeypatch.delenv("TOKEN_RESERVATION_TTL_SECONDS", raising=False)
+    monkeypatch.delenv("USER_RATE_LIMIT_REQUESTS", raising=False)
+    monkeypatch.delenv("USER_RATE_LIMIT_WINDOW_SECONDS", raising=False)
 
     module = _reload_bot(monkeypatch)
 
@@ -34,6 +36,8 @@ def test_response_cache_defaults(monkeypatch):
     assert module.PREMIUM_DAILY_TOKEN_LIMIT == 1000000
     assert module.TOKEN_QUOTA_RESET_TIMEZONE == "UTC"
     assert module.TOKEN_RESERVATION_TTL_SECONDS == 900
+    assert module.USER_RATE_LIMIT_REQUESTS == 10
+    assert module.USER_RATE_LIMIT_WINDOW_SECONDS == 3600
     assert module.RESPONSE_CACHE_ENABLED is True
     assert module.RESPONSE_CACHE_STATIC_TTL_SECONDS == 604800
     assert module.RESPONSE_CACHE_META_TTL_SECONDS == 21600
@@ -58,6 +62,8 @@ def test_quota_limits_and_reservation_ttl_reject_non_positive_values(monkeypatch
         "FREE_DAILY_TOKEN_LIMIT",
         "PREMIUM_DAILY_TOKEN_LIMIT",
         "TOKEN_RESERVATION_TTL_SECONDS",
+        "USER_RATE_LIMIT_REQUESTS",
+        "USER_RATE_LIMIT_WINDOW_SECONDS",
     ):
         monkeypatch.setenv(setting, "0")
         try:

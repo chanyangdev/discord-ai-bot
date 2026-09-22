@@ -70,6 +70,14 @@ def test_cache_hit_bypasses_generation_and_history(monkeypatch, tmp_path):
         assert (answer, from_cache) == ("cached answer", True)
         assert provider_calls == []
         assert list(bot.conversation_history.get("cache-conversation", ())) == []
+        rate_limit = await store.get_user_rate_limit_status(
+            user_id=1,
+            limit=bot.USER_RATE_LIMIT_REQUESTS,
+            window_seconds=bot.USER_RATE_LIMIT_WINDOW_SECONDS,
+        )
+        assert rate_limit.request_count == 1
+        assert (await store.get_daily_usage(1)).prompt_tokens == 0
+        assert (await store.get_global_cost_usage()).committed_microdollars == 0
         await store.close()
 
     asyncio.run(run())

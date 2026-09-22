@@ -1,7 +1,7 @@
 import asyncio
 import importlib
 
-from storage import DailyUsage
+from storage import DailyUsage, RateLimitResult
 
 
 class FakeUsageStore:
@@ -19,6 +19,9 @@ class FakeUsageStore:
             successful_requests=2,
             updated_at=123,
         )
+
+    async def get_user_rate_limit_status(self, **kwargs):
+        return RateLimitResult(True, 4, 10)
 
 
 class FakeQuotaService:
@@ -70,9 +73,9 @@ def test_usage_command_is_private_and_user_scoped(monkeypatch):
     assert usage_store.requested_user_ids == [42]
     assert quota_service.requested_user_ids == [42]
     assert interaction.response.ephemeral is True
-    assert "Committed tokens: `150`" in interaction.response.content
-    assert "Daily limit: `1,000`" in interaction.response.content
-    assert "Remaining tokens: `850`" in interaction.response.content
+    assert "AI requests: `4 / 10` in the last hour" in interaction.response.content
+    assert "Daily tokens: `150 / 1,000`" in interaction.response.content
+    assert "Daily tokens remaining: `850`" in interaction.response.content
     assert "00:00 UTC" in interaction.response.content
     assert "reserved" not in interaction.response.content.lower()
     assert "updated" not in interaction.response.content.lower()
@@ -92,12 +95,13 @@ def test_usage_formatter_never_shows_private_fields(monkeypatch):
             updated_at=456,
         ),
         20,
+        RateLimitResult(True, 3, 10),
     )
 
     assert response == (
-        "**Daily quota**\n"
-        "Committed tokens: `15`\n"
-        "Daily limit: `20`\n"
-        "Remaining tokens: `5`\n"
-        "Resets: `00:00 UTC`"
+        "**AI usage**\n"
+        "AI requests: `3 / 10` in the last hour\n"
+        "Daily tokens: `15 / 20`\n"
+        "Daily tokens remaining: `5`\n"
+        "Token reset: `00:00 UTC`"
     )

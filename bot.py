@@ -6,6 +6,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,7 +43,13 @@ from response_cache import (
     parse_canonical_patch_version,
     question_hash,
 )
-from storage import DailyUsage, GlobalCostUsage, QuotaExceeded, TokenUsageStore
+from storage import (
+    DailyUsage,
+    GlobalCostUsage,
+    QuotaExceeded,
+    RateLimitResult,
+    TokenUsageStore,
+)
 
 load_dotenv()
 
@@ -118,6 +125,11 @@ FREE_DAILY_TOKEN_LIMIT: int = _get_positive_int_env(
 PREMIUM_DAILY_TOKEN_LIMIT: int = _get_positive_int_env(
     "PREMIUM_DAILY_TOKEN_LIMIT",
     1000000,
+)
+USER_RATE_LIMIT_REQUESTS = _get_positive_int_env("USER_RATE_LIMIT_REQUESTS", 10)
+USER_RATE_LIMIT_WINDOW_SECONDS = _get_positive_int_env(
+    "USER_RATE_LIMIT_WINDOW_SECONDS",
+    3600,
 )
 TOKEN_QUOTA_RESET_TIMEZONE: str = "UTC"
 TOKEN_RESERVATION_TTL_SECONDS: int = _get_positive_int_env(
@@ -323,9 +335,19 @@ PROVIDER_ERROR_MESSAGE = (
     "Sorry, I couldn't generate a response right now. Please try again later."
 )
 BUDGET_EXHAUSTED_MESSAGE = (
-    "The daily AI budget is exhausted. Free features remain available; please try again tomorrow."
+    "The daily AI budget is exhausted. Cached and local features are still available. "
+    "Please try again after 00:00 UTC."
 )
 QUEUE_RETRY_MESSAGE = "High traffic right now. Please try again later."
+
+
+class RateLimitExceeded(RuntimeError):
+    """Raised when an accepted AI request would exceed a user's rolling limit."""
+
+
+def _rate_limit_message(retry_after_seconds: int) -> str:
+    minutes = max(1, ceil(retry_after_seconds / 60))
+    return f"You're sending requests too quickly. Try again in about {minutes} minutes."
 SYSTEM_PROMPT = """
 You are a friendly, practical AI assistant in a Discord server.
 
@@ -366,15 +388,19 @@ async def _no_verified_paid_entitlement(user_id: int) -> bool:
     return False
 
 
-def format_usage_response(usage: DailyUsage, daily_limit: int) -> str:
+def format_usage_response(
+    usage: DailyUsage,
+    daily_limit: int,
+    rate_limit: RateLimitResult,
+) -> str:
     committed_tokens = usage.prompt_tokens + usage.completion_tokens
     remaining_tokens = max(0, daily_limit - committed_tokens)
     return (
-        "**Daily quota**\n"
-        f"Committed tokens: `{committed_tokens:,}`\n"
-        f"Daily limit: `{daily_limit:,}`\n"
-        f"Remaining tokens: `{remaining_tokens:,}`\n"
-        "Resets: `00:00 UTC`"
+        "**AI usage**\n"
+        f"AI requests: `{rate_limit.request_count} / {rate_limit.limit}` in the last hour\n"
+        f"Daily tokens: `{committed_tokens:,} / {daily_limit:,}`\n"
+        f"Daily tokens remaining: `{remaining_tokens:,}`\n"
+        "Token reset: `00:00 UTC`"
     )
 
 
@@ -534,6 +560,18 @@ async def generate_interactive_reply(
 ) -> tuple[str, bool]:
     if discord_client.response_cache is None:
         await discord_client.setup_hook()
+    if discord_client.token_usage_store is None:
+        raise RuntimeError("SQLite usage store is unavailable")
+    rate_limit = await discord_client.token_usage_store.acquire_user_rate_limit(
+        user_id=user_id,
+        limit=USER_RATE_LIMIT_REQUESTS,
+        window_seconds=USER_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not rate_limit.accepted:
+        await status_message.edit(
+            content=_rate_limit_message(rate_limit.retry_after_seconds)
+        )
+        raise RateLimitExceeded()
     cache = discord_client.response_cache
     _, decision = await _current_policy()
     policy = decide_cache_policy(
@@ -627,19 +665,8 @@ async def stream_openrouter_reply(
                         POLICY.config.daily_budget_microdollars,
                     )
                 except QuotaExceeded:
-                    _, decision = await _current_policy()
-                    if not decision.allowed_models:
-                        await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
-                        raise BudgetUnavailable("global_budget")
-                    decision = POLICY.decide(
-                        committed_microdollars=POLICY.config.daily_budget_microdollars,
-                        reserved_microdollars=0,
-                        normal_models=tuple(OPENROUTER_MODELS),
-                        paid_path_disabled=True,
-                    )
-                    if not decision.allowed_models:
-                        await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
-                        raise BudgetUnavailable("global_budget")
+                    await status_message.edit(content=BUDGET_EXHAUSTED_MESSAGE)
+                    raise BudgetUnavailable("global_budget")
 
             reserved_amount = 0
             try:
@@ -785,7 +812,7 @@ async def answer_in_thread(
             )
     except QuotaExceeded:
         return
-    except (AdmissionError, AdmissionShutdown, BudgetUnavailable):
+    except (AdmissionError, AdmissionShutdown, BudgetUnavailable, RateLimitExceeded):
         return
     except Exception as error:
         logger.warning("OpenRouter request failed: %s", type(error).__name__)
@@ -838,6 +865,9 @@ async def handle_slash_ai_request(
             "This command must be used in a server channel or thread.",
             ephemeral=True,
         )
+        return
+    if not prompt.strip():
+        await interaction.response.send_message("Please provide a question.", ephemeral=True)
         return
 
     await interaction.response.send_message("Thinking…")
@@ -896,8 +926,13 @@ async def usage_command(interaction: discord.Interaction) -> None:
     daily_limit = await discord_client.quota_service.resolve_daily_limit(
         interaction.user.id
     )
+    rate_limit = await discord_client.token_usage_store.get_user_rate_limit_status(
+        user_id=interaction.user.id,
+        limit=USER_RATE_LIMIT_REQUESTS,
+        window_seconds=USER_RATE_LIMIT_WINDOW_SECONDS,
+    )
     await interaction.response.send_message(
-        format_usage_response(usage, daily_limit),
+        format_usage_response(usage, daily_limit, rate_limit),
         ephemeral=True,
     )
 
@@ -970,6 +1005,7 @@ async def budget_status_command(interaction: discord.Interaction) -> None:
     budget = Decimal(POLICY.config.daily_budget_microdollars) / Decimal(1_000_000)
     committed = Decimal(usage.committed_microdollars) / Decimal(1_000_000)
     reserved = Decimal(usage.reserved_microdollars) / Decimal(1_000_000)
+    remaining = max(Decimal(0), budget - committed - reserved)
     utilization = decision.utilization_ratio * Decimal(100)
     await interaction.response.send_message(
         "**AI budget status**\n"
@@ -977,6 +1013,7 @@ async def budget_status_command(interaction: discord.Interaction) -> None:
         f"Utilization: `{utilization:.2f}%`\n"
         f"Committed: `${committed:.6f}` / `${budget:.6f}`\n"
         f"Reserved: `${reserved:.6f}`\n"
+        f"Remaining: `${remaining:.6f}`\n"
         f"Active requests: `{AI_ADMISSION.active}`\n"
         f"Queued requests: `{AI_ADMISSION.waiting}`\n"
         f"Output limit: `{decision.max_output_tokens}`\n"

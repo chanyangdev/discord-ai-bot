@@ -1,4 +1,6 @@
 import os
+import uuid
+from math import ceil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +38,14 @@ class GlobalCostUsage:
     reserved_microdollars: int = 0
     successful_paid_requests: int = 0
     updated_at: int = 0
+
+
+@dataclass(frozen=True)
+class RateLimitResult:
+    accepted: bool
+    request_count: int
+    limit: int
+    retry_after_seconds: int = 0
 
 
 def _validate_non_negative_int(name: str, value: int) -> int:
@@ -158,6 +168,19 @@ class TokenUsageStore:
             )
             await connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS user_rate_limit_events (
+                    event_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            await connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_rate_limit_events_lookup "
+                "ON user_rate_limit_events (user_id, created_at)"
+            )
+            await connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS global_provider_cost_usage (
                     usage_date TEXT PRIMARY KEY,
                     committed_microdollars INTEGER NOT NULL DEFAULT 0
@@ -190,6 +213,92 @@ class TokenUsageStore:
 
     async def close(self) -> None:
         return None
+
+    async def acquire_user_rate_limit(
+        self,
+        *,
+        user_id: int,
+        limit: int,
+        window_seconds: int,
+    ) -> RateLimitResult:
+        _validate_non_negative_int("user_id", user_id)
+        limit = _validate_positive_int("limit", limit)
+        window_seconds = _validate_positive_int("window_seconds", window_seconds)
+        timestamp = _utc_timestamp()
+        window_start = timestamp - window_seconds
+
+        async with connect_sqlite(self.db_path) as connection:
+            try:
+                await _prepare_connection(connection)
+                await connection.execute("BEGIN IMMEDIATE")
+                await connection.execute(
+                    "DELETE FROM user_rate_limit_events "
+                    "WHERE user_id = ? AND created_at <= ?",
+                    (user_id, window_start),
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM user_rate_limit_events
+                    WHERE rowid IN (
+                        SELECT rowid FROM user_rate_limit_events
+                        WHERE created_at <= ?
+                        LIMIT 100
+                    )
+                    """,
+                    (window_start,),
+                )
+                cursor = await connection.execute(
+                    "SELECT COUNT(*), MIN(created_at) FROM user_rate_limit_events "
+                    "WHERE user_id = ? AND created_at > ?",
+                    (user_id, window_start),
+                )
+                count, oldest_event = await cursor.fetchone()
+                count = int(count)
+                if count >= limit:
+                    retry_after = max(
+                        1,
+                        ceil(int(oldest_event) + window_seconds - timestamp),
+                    )
+                    await connection.commit()
+                    return RateLimitResult(False, count, limit, retry_after)
+                await connection.execute(
+                    "INSERT INTO user_rate_limit_events (event_id, user_id, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (uuid.uuid4().hex, user_id, timestamp),
+                )
+                await connection.commit()
+                return RateLimitResult(True, count + 1, limit)
+            except BaseException:
+                await connection.rollback()
+                raise
+
+    async def get_user_rate_limit_status(
+        self,
+        *,
+        user_id: int,
+        limit: int,
+        window_seconds: int,
+    ) -> RateLimitResult:
+        _validate_non_negative_int("user_id", user_id)
+        limit = _validate_positive_int("limit", limit)
+        window_seconds = _validate_positive_int("window_seconds", window_seconds)
+        timestamp = _utc_timestamp()
+        window_start = timestamp - window_seconds
+        async with connect_sqlite(self.db_path) as connection:
+            await _prepare_connection(connection)
+            cursor = await connection.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM user_rate_limit_events "
+                "WHERE user_id = ? AND created_at > ?",
+                (user_id, window_start),
+            )
+            count, oldest_event = await cursor.fetchone()
+        count = int(count)
+        retry_after = (
+            max(1, ceil(int(oldest_event) + window_seconds - timestamp))
+            if count >= limit and oldest_event is not None
+            else 0
+        )
+        return RateLimitResult(count < limit, count, limit, retry_after)
 
     async def get_daily_usage(self, user_id: int) -> DailyUsage:
         _validate_non_negative_int("user_id", user_id)
