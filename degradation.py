@@ -45,6 +45,7 @@ class DegradationPolicyConfig:
     economy_max_output_tokens: int
     economy_models: tuple[str, ...]
     paid_llm_enabled: bool
+    free_models: tuple[str, ...] | None = None
 
     def validate(self) -> None:
         if self.daily_budget_microdollars <= 0:
@@ -77,6 +78,11 @@ class DegradationPolicyConfig:
             raise ValueError("economy models must contain one to three models")
         if any(not model.strip() for model in self.economy_models):
             raise ValueError("economy models must be non-empty")
+        if self.free_models is not None:
+            if not self.free_models:
+                raise ValueError("free models must contain at least one model")
+            if any(not model.strip() for model in self.free_models):
+                raise ValueError("free models must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -115,7 +121,10 @@ class DegradationPolicy:
         )
         if paid_path_disabled or utilization >= self.config.free_only_threshold:
             mode = BudgetMode.FREE_ONLY
-            models = tuple(model for model in normal_models if is_free_model(model))
+            if self.config.free_models is not None:
+                models = self.config.free_models
+            else:
+                models = tuple(model for model in normal_models if is_free_model(model))
             reason = "paid_path_disabled" if paid_path_disabled else "budget_exhausted"
             return DegradationDecision(
                 mode,
